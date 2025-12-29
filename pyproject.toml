@@ -9,3 +9,8 @@ dependencies = [
     "numpy>=2.4.0",
     "pyspark>=4.1.0",
 ]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+]
