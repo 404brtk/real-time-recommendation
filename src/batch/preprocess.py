@@ -22,15 +22,9 @@ def create_spark_session():
 
 def read_raw_data(spark):
     logger.info("Reading RAW data...")
-    df_customers = spark.read.csv(
-        str(RAW_DIR / "customers.csv"), header=True, inferSchema=True
-    )
-    df_articles = spark.read.csv(
-        str(RAW_DIR / "articles.csv"), header=True, inferSchema=True
-    )
-    df_transactions = spark.read.csv(
-        str(RAW_DIR / "transactions_train.csv"), header=True, inferSchema=True
-    )
+    df_customers = spark.read.parquet(str(RAW_DIR / "customers.parquet"))
+    df_articles = spark.read.parquet(str(RAW_DIR / "articles.parquet"))
+    df_transactions = spark.read.parquet(str(RAW_DIR / "transactions.parquet"))
     return df_customers, df_articles, df_transactions
 
 
