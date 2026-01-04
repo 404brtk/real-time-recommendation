@@ -2,6 +2,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.ml.feature import StringIndexer
 from src.logging import setup_logging
+from src.config import (
+    RAW_DIR,
+    PROCESSED_DIR,
+    MAPPINGS_DIR,
+)
 
 logger = setup_logging("preprocess.log")
 
@@ -18,11 +23,13 @@ def create_spark_session():
 def read_raw_data(spark):
     logger.info("Reading RAW data...")
     df_customers = spark.read.csv(
-        "data/raw/customers.csv", header=True, inferSchema=True
+        str(RAW_DIR / "customers.csv"), header=True, inferSchema=True
     )
-    df_articles = spark.read.csv("data/raw/articles.csv", header=True, inferSchema=True)
+    df_articles = spark.read.csv(
+        str(RAW_DIR / "articles.csv"), header=True, inferSchema=True
+    )
     df_transactions = spark.read.csv(
-        "data/raw/transactions_train.csv", header=True, inferSchema=True
+        str(RAW_DIR / "transactions_train.csv"), header=True, inferSchema=True
     )
     return df_customers, df_articles, df_transactions
 
@@ -38,7 +45,7 @@ def build_user_mapping(df_customers, df_transactions):
         .select("customer_id", "user_idx")
         .distinct()
     )
-    df_user_map.write.mode("overwrite").parquet("data/mappings/user_map.parquet")
+    df_user_map.write.mode("overwrite").parquet(str(MAPPINGS_DIR / "user_map.parquet"))
     logger.info("User ID mapping saved.")
     return user_indexer_model
 
@@ -54,7 +61,7 @@ def build_item_mapping(df_articles):
         .select("article_id", "item_idx")
         .distinct()
     )
-    df_item_map.write.mode("overwrite").parquet("data/mappings/item_map.parquet")
+    df_item_map.write.mode("overwrite").parquet(str(MAPPINGS_DIR / "item_map.parquet"))
     logger.info("Item ID mapping saved.")
     return item_indexer_model
 
@@ -64,10 +71,6 @@ def transform_transactions(df_transactions, user_indexer_model, item_indexer_mod
     df_transactions_users = user_indexer_model.transform(df_transactions)
     df_transactions_final = item_indexer_model.transform(df_transactions_users)
 
-    # ALS needs 'rating' column even though it's implicit feedback
-    # we can bypass it by either setting everything to 1 or using count of interactions
-    # in this case we'll set everything to count
-    # or actually use log(1+count) so that extreme counts don't dominate too much
     df_interactions = (
         df_transactions_final.groupBy("user_idx", "item_idx")
         .agg(F.log1p(F.count("article_id")).alias("rating"))
@@ -83,7 +86,9 @@ def transform_transactions(df_transactions, user_indexer_model, item_indexer_mod
 
 
 def save_processed_data(df_interactions):
-    df_interactions.write.mode("overwrite").parquet("data/processed/train_data.parquet")
+    df_interactions.write.mode("overwrite").parquet(
+        str(PROCESSED_DIR / "train_data.parquet")
+    )
     logger.info(
         "Preprocessing completed successfully. The data is ready at data/processed/"
     )
