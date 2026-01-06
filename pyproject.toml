@@ -5,6 +5,7 @@ description = "real time recommendation system"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "delta-spark>=4.0.0",
     "fastapi[standard]>=0.128.0",
     "kafka-python>=2.3.0",
     "numpy>=2.4.0",
