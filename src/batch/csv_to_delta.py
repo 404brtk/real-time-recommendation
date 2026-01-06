@@ -3,10 +3,24 @@ from src.config import RAW_DIR, DATA_DIR
 from src.logging import setup_logging
 from pyspark.sql import functions as F
 
-logger = setup_logging("csv_to_parquet.log")
+logger = setup_logging("csv_to_delta.log")
 
 
-def convert_csv_to_parquet(spark):
+def create_spark_session():
+    return (
+        SparkSession.builder.appName("CSV_to_Delta")
+        .config("spark.driver.memory", "2g")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+        .master("local[*]")
+        .getOrCreate()
+    )
+
+
+def convert_csv_to_delta(spark):
     logger.info(f"Reading CSV files from {RAW_DIR}...")
 
     df_customers = spark.read.csv(
@@ -29,28 +43,23 @@ def convert_csv_to_parquet(spark):
         "article_id", F.format_string("%010d", F.col("article_id").cast("int"))
     )
 
-    logger.info("Saving as parquet...")
-    df_customers.write.mode("overwrite").parquet(
-        str(DATA_DIR / "raw" / "customers.parquet")
+    logger.info("Saving as Delta Lake tables...")
+    df_customers.write.format("delta").mode("overwrite").save(
+        str(DATA_DIR / "raw" / "customers")
     )
-    df_articles.write.mode("overwrite").parquet(
-        str(DATA_DIR / "raw" / "articles.parquet")
+    df_articles.write.format("delta").mode("overwrite").save(
+        str(DATA_DIR / "raw" / "articles")
     )
-    df_transactions.write.mode("overwrite").parquet(
-        str(DATA_DIR / "raw" / "transactions.parquet")
+    df_transactions.write.format("delta").mode("overwrite").save(
+        str(DATA_DIR / "raw" / "transactions")
     )
 
-    logger.info("CSV to Parquet conversion completed.")
+    logger.info("CSV to Delta Lake conversion completed.")
 
 
 def main():
-    spark = (
-        SparkSession.builder.appName("CSV_to_Parquet")
-        .config("spark.driver.memory", "2g")
-        .master("local[*]")
-        .getOrCreate()
-    )
-    convert_csv_to_parquet(spark)
+    spark = create_spark_session()
+    convert_csv_to_delta(spark)
     spark.stop()
 
 

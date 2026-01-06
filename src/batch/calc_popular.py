@@ -19,16 +19,21 @@ DAYS_LOOKBACK = 30
 
 def create_spark_session():
     return (
-        SparkSession.builder.appName("ALS_Training")
+        SparkSession.builder.appName("CalculatePopularItems")
         .config("spark.driver.memory", "4g")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
         .master("local[*]")
         .getOrCreate()
     )
 
 
 def get_trending_items(spark, k=100):
-    logger.info("Reading RAW transactions to get dates...")
-    df_transactions = spark.read.parquet(str(RAW_DIR / "transactions.parquet"))
+    logger.info("Reading RAW transactions from Delta Lake...")
+    df_transactions = spark.read.format("delta").load(str(RAW_DIR / "transactions"))
 
     # for now we cannot really use current_date() as data is historical
     # so we'd just get empty results
@@ -60,14 +65,14 @@ def map_and_enrich(spark, trending_df):
     """
     map article_id to item_idx and enrich with metadata
     """
-    logger.info("Mapping IDs and enriching with metadata...")
+    logger.info("Mapping IDs and enriching with metadata from Delta Lake...")
 
     trending_df = trending_df.withColumn(
         "article_id", F.col("article_id").cast("string")
     )
-    df_map = spark.read.parquet(str(MAPPINGS_DIR / "item_map.parquet"))
+    df_map = spark.read.format("delta").load(str(MAPPINGS_DIR / "item_map"))
     df_map = df_map.withColumn("article_id", F.col("article_id").cast("string"))
-    df_meta = spark.read.parquet(str(RAW_DIR / "articles.parquet"))
+    df_meta = spark.read.format("delta").load(str(RAW_DIR / "articles"))
     df_meta = df_meta.withColumn("article_id", F.col("article_id").cast("string"))
 
     # inner join to keep only items present in map

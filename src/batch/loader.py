@@ -1,7 +1,7 @@
-import pandas as pd
-import redis
 import json
+import redis
 
+from pyspark.sql import SparkSession
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 
@@ -22,7 +22,19 @@ from src.config import (
 
 logger = setup_logging("loader.log")
 
-# TODO: possibly switch to pyspark here too
+
+def create_spark_session():
+    return (
+        SparkSession.builder.appName("Loader")
+        .config("spark.driver.memory", "4g")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+        .master("local[*]")
+        .getOrCreate()
+    )
 
 
 def get_redis_client():
@@ -33,24 +45,28 @@ def get_qdrant_client():
     return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
 
-def load_users_to_redis():
-    logger.info("Loading Users to Redis...")
+def load_users_to_redis(spark):
+    logger.info("Loading Users from Delta Lake to Redis...")
     r = get_redis_client()
 
-    users_path = str(MODELS_DIR / "user_factors.parquet")
+    users_path = str(MODELS_DIR / "user_factors")
     logger.info(f"Reading {users_path}...")
-    df_users = pd.read_parquet(users_path)
+    df_users = spark.read.format("delta").load(users_path)
 
-    logger.info(f"Uploading {len(df_users)} user vectors to Redis pipeline...")
+    # collect to driver and upload in batches
+    logger.info("Collecting user vectors...")
+    users_data = df_users.collect()
+
+    logger.info(f"Uploading {len(users_data)} user vectors to Redis pipeline...")
 
     # use pipeline for batch operations
     pipe = r.pipeline()
     batch_size = 10000
     count = 0
 
-    for _, row in df_users.iterrows():
+    for row in users_data:
         user_id = row["id"]
-        vector = row["features"].tolist()
+        vector = list(row["features"])
 
         key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
         pipe.set(key, json.dumps(vector))
@@ -63,29 +79,30 @@ def load_users_to_redis():
     pipe.execute()
     logger.info(f"\nSuccessfully uploaded {count} user vectors to Redis.")
 
+    r.close()
 
-def load_items_to_qdrant():
-    logger.info("Loading Items to Qdrant...")
+
+def load_items_to_qdrant(spark):
+    logger.info("Loading Items from Delta Lake to Qdrant...")
     client = get_qdrant_client()
 
     # load item vectors from ALS model
-    df_vectors = pd.read_parquet(str(MODELS_DIR / "item_factors.parquet"))
+    df_vectors = spark.read.format("delta").load(str(MODELS_DIR / "item_factors"))
     # load mapping from article_id to item_idx
-    df_map = pd.read_parquet(str(MAPPINGS_DIR / "item_map.parquet"))
+    df_map = spark.read.format("delta").load(str(MAPPINGS_DIR / "item_map"))
     # make sure article_id is string
-    df_map["article_id"] = df_map["article_id"].astype(str)
+    df_map = df_map.withColumn("article_id", df_map["article_id"].cast("string"))
 
     logger.info(f"Reading metadata from {RAW_DIR}...")
-    df_meta = pd.read_parquet(str(RAW_DIR / "articles.parquet"))
-    df_meta["article_id"] = df_meta["article_id"].astype(str)
+    df_meta = spark.read.format("delta").load(str(RAW_DIR / "articles"))
+    df_meta = df_meta.withColumn("article_id", df_meta["article_id"].cast("string"))
 
     logger.info("Merging vectors with metadata...")
 
     # join vectors with mapping to get article_id for each vector
-    df_merged = df_vectors.merge(df_map, left_on="id", right_on="item_idx")
-    df_merged["article_id"] = df_merged["article_id"].astype(str)
+    df_merged = df_vectors.join(df_map, df_vectors["id"] == df_map["item_idx"])
     # join with metadata to get product details
-    df_full = df_merged.merge(df_meta, on="article_id", how="left")
+    df_full = df_merged.join(df_meta, on="article_id", how="left")
 
     # columns to store as payload in Qdrant for filtering/display
     payload_cols = [
@@ -96,7 +113,13 @@ def load_items_to_qdrant():
         "graphical_appearance_name",
         "index_group_name",
     ]
-    df_full[payload_cols] = df_full[payload_cols].fillna("")
+
+    # fill nulls and collect
+    for col in payload_cols:
+        df_full = df_full.fillna({col: ""})
+
+    logger.info("Collecting item data...")
+    items_data = df_full.select("item_idx", "features", *payload_cols).collect()
 
     # delete existing collection if it exists, then create a new one
     logger.info("Deleting existing Qdrant collection if exists...")
@@ -111,14 +134,14 @@ def load_items_to_qdrant():
         vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
     )
 
-    logger.info(f"Uploading {len(df_full)} items to Qdrant...")
+    logger.info(f"Uploading {len(items_data)} items to Qdrant...")
 
     points = []
     batch_size = 5000
 
-    for i, row in df_full.iterrows():
+    for i, row in enumerate(items_data):
         point_id = int(row["item_idx"])
-        vector = row["features"].tolist()
+        vector = list(row["features"])
 
         payload = {col: row[col] for col in payload_cols}
 
@@ -126,7 +149,7 @@ def load_items_to_qdrant():
 
         if len(points) >= batch_size:
             client.upload_points(collection_name=QDRANT_COLLECTION_NAME, points=points)
-            print(f"Uploaded {i} items...", end="\r")
+            print(f"Uploaded {i + 1} items...", end="\r")
             points = []
 
     if points:
@@ -138,13 +161,16 @@ def load_items_to_qdrant():
 
 
 def main():
+    spark = create_spark_session()
     try:
-        load_users_to_redis()
-        load_items_to_qdrant()
+        load_users_to_redis(spark)
+        load_items_to_qdrant(spark)
         logger.info("Loader finished successfully!")
     except Exception as e:
         logger.error(f"Loader failed: {e}")
         raise
+    finally:
+        spark.stop()
 
 
 if __name__ == "__main__":

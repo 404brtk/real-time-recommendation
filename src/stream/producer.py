@@ -1,7 +1,7 @@
 import json
 import time
 import random
-import pandas as pd
+from pyspark.sql import SparkSession
 from kafka import KafkaProducer
 
 from src.config import (
@@ -14,20 +14,36 @@ from src.logging import setup_logging
 logger = setup_logging("producer.log")
 
 
-def load_simulation_data():
-    logger.info("Loading mapping files...")
+def create_spark_session():
+    return (
+        SparkSession.builder.appName("Producer")
+        .config("spark.driver.memory", "2g")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+        .master("local[*]")
+        .getOrCreate()
+    )
+
+
+def load_simulation_data(spark):
+    logger.info("Loading mapping files from Delta Lake...")
 
     # load mapping: customer_id (hash) <-> user_idx (int)
-    df_users = pd.read_parquet(str(MAPPINGS_DIR / "user_map.parquet"))
+    df_users = spark.read.format("delta").load(str(MAPPINGS_DIR / "user_map"))
     # ensure customer_id is string
-    df_users["customer_id"] = df_users["customer_id"].astype(str)
-    # convert df to a list of records for O(1) random sampling via list indexing
-    users_pool = df_users.to_dict("records")
+    df_users = df_users.withColumn(
+        "customer_id", df_users["customer_id"].cast("string")
+    )
+    # collect and convert df to a list of records for O(1) random sampling via list indexing
+    users_pool = [row.asDict() for row in df_users.collect()]
 
     # load mapping: article_id (string like "0101010101") <-> item_idx (int)
-    df_items = pd.read_parquet(str(MAPPINGS_DIR / "item_map.parquet"))
-    df_items["article_id"] = df_items["article_id"].astype(str)
-    items_pool = df_items.to_dict("records")
+    df_items = spark.read.format("delta").load(str(MAPPINGS_DIR / "item_map"))
+    df_items = df_items.withColumn("article_id", df_items["article_id"].cast("string"))
+    items_pool = [row.asDict() for row in df_items.collect()]
 
     logger.info(
         f"Loaded {len(users_pool)} users and {len(items_pool)} items into memory."
@@ -36,6 +52,7 @@ def load_simulation_data():
 
 
 def main():
+    spark = create_spark_session()
     try:
         producer = KafkaProducer(
             bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
@@ -44,9 +61,12 @@ def main():
         logger.info(f"Connected to Kafka at {KAFKA_BOOTSTRAP_SERVERS}")
     except Exception as e:
         logger.error(f"Failed to connect to Kafka: {e}")
+        spark.stop()
         return
 
-    users_pool, items_pool = load_simulation_data()
+    users_pool, items_pool = load_simulation_data(spark)
+    # stop spark after loading data - we dont need it for streaming
+    spark.stop()
 
     if not users_pool or not items_pool:
         logger.error("Data pools are empty. Exiting.")

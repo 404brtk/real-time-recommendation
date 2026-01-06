@@ -13,14 +13,19 @@ def create_spark_session():
         SparkSession.builder.appName("ALS_Training")
         .config("spark.driver.memory", "8g")
         .config("spark.sql.shuffle.partitions", "200")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
         .master("local[*]")
         .getOrCreate()
     )
 
 
 def train_als_model(spark):
-    logger.info("Loading training data...")
-    df_train = spark.read.parquet(str(PROCESSED_DIR / "train_data.parquet"))
+    logger.info("Loading training data from Delta Lake...")
+    df_train = spark.read.format("delta").load(str(PROCESSED_DIR / "train_data"))
 
     als = ALS(
         userCol="user_idx",
@@ -44,17 +49,17 @@ def train_als_model(spark):
 
 
 def save_factors(model):
-    logger.info("Saving user and item factors...")
+    logger.info("Saving user and item factors to Delta Lake...")
 
-    model.userFactors.write.mode("overwrite").parquet(
-        str(MODELS_DIR / "user_factors.parquet")
+    model.userFactors.write.format("delta").mode("overwrite").save(
+        str(MODELS_DIR / "user_factors")
     )
-    logger.info("User factors saved to data/models/user_factors.parquet")
+    logger.info("User factors saved to data/models/user_factors")
 
-    model.itemFactors.write.mode("overwrite").parquet(
-        str(MODELS_DIR / "item_factors.parquet")
+    model.itemFactors.write.format("delta").mode("overwrite").save(
+        str(MODELS_DIR / "item_factors")
     )
-    logger.info("Item factors saved to data/models/item_factors.parquet")
+    logger.info("Item factors saved to data/models/item_factors")
 
 
 def main():

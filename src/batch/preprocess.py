@@ -15,16 +15,21 @@ def create_spark_session():
     return (
         SparkSession.builder.appName("ETL")
         .config("spark.driver.memory", "8g")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
         .master("local[*]")
         .getOrCreate()
     )
 
 
 def read_raw_data(spark):
-    logger.info("Reading RAW data...")
-    df_customers = spark.read.parquet(str(RAW_DIR / "customers.parquet"))
-    df_articles = spark.read.parquet(str(RAW_DIR / "articles.parquet"))
-    df_transactions = spark.read.parquet(str(RAW_DIR / "transactions.parquet"))
+    logger.info("Reading RAW data from Delta Lake...")
+    df_customers = spark.read.format("delta").load(str(RAW_DIR / "customers"))
+    df_articles = spark.read.format("delta").load(str(RAW_DIR / "articles"))
+    df_transactions = spark.read.format("delta").load(str(RAW_DIR / "transactions"))
     return df_customers, df_articles, df_transactions
 
 
@@ -39,8 +44,10 @@ def build_user_mapping(df_customers, df_transactions):
         .select("customer_id", "user_idx")
         .distinct()
     )
-    df_user_map.write.mode("overwrite").parquet(str(MAPPINGS_DIR / "user_map.parquet"))
-    logger.info("User ID mapping saved.")
+    df_user_map.write.format("delta").mode("overwrite").save(
+        str(MAPPINGS_DIR / "user_map")
+    )
+    logger.info("User ID mapping saved to Delta Lake.")
     return user_indexer_model
 
 
@@ -59,8 +66,10 @@ def build_item_mapping(df_articles):
         .select("article_id", "item_idx")
         .distinct()
     )
-    df_item_map.write.mode("overwrite").parquet(str(MAPPINGS_DIR / "item_map.parquet"))
-    logger.info("Item ID mapping saved.")
+    df_item_map.write.format("delta").mode("overwrite").save(
+        str(MAPPINGS_DIR / "item_map")
+    )
+    logger.info("Item ID mapping saved to Delta Lake.")
     return item_indexer_model
 
 
@@ -84,11 +93,11 @@ def transform_transactions(df_transactions, user_indexer_model, item_indexer_mod
 
 
 def save_processed_data(df_interactions):
-    df_interactions.write.mode("overwrite").parquet(
-        str(PROCESSED_DIR / "train_data.parquet")
+    df_interactions.write.format("delta").mode("overwrite").save(
+        str(PROCESSED_DIR / "train_data")
     )
     logger.info(
-        "Preprocessing completed successfully. The data is ready at data/processed/"
+        "Preprocessing completed successfully. Delta Lake tables ready at data/processed/"
     )
 
 
