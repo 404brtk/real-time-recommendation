@@ -19,3 +19,7 @@ QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
 QDRANT_PORT = int(os.getenv("QDRANT_PORT", 6333))
 QDRANT_COLLECTION_NAME = "items"
 VECTOR_SIZE = 32  # the same as in als rank
+
+# kafka
+KAFKA_BOOTSTRAP_SERVERS = ["localhost:9092"]
+KAFKA_TOPIC_EVENTS = "user_events"
