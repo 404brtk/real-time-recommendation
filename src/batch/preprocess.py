@@ -46,6 +46,10 @@ def build_user_mapping(df_customers, df_transactions):
 
 def build_item_mapping(df_articles):
     logger.info("Building mapping for Item ID")
+    # make sure article_id is string
+    df_articles = df_articles.withColumn(
+        "article_id", F.col("article_id").cast("string")
+    )
     item_indexer = StringIndexer(
         inputCol="article_id", outputCol="item_idx", handleInvalid="keep"
     )

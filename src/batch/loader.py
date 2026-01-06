@@ -70,6 +70,8 @@ def load_items_to_qdrant():
     df_vectors = pd.read_parquet(str(MODELS_DIR / "item_factors.parquet"))
     # load mapping from article_id to item_idx
     df_map = pd.read_parquet(str(MAPPINGS_DIR / "item_map.parquet"))
+    # make sure article_id is string
+    df_map["article_id"] = df_map["article_id"].astype(str)
 
     logger.info(f"Reading metadata from {RAW_DIR}...")
     df_meta = pd.read_parquet(str(RAW_DIR / "articles.parquet"))
