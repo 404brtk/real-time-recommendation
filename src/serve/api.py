@@ -16,6 +16,7 @@ from src.config import (
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
+    REDIS_POPULAR_KEY,
 )
 
 from src.serve.schemas import RecommendationItem, RecommendationResponse
@@ -100,46 +101,72 @@ async def health_check(
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
 async def recommend(
     user_id: str,
-    k: int = Query(1, gt=0, le=50, description="Number of recommendations"),
-    # dependency injection
+    k: int = Query(10, gt=0, le=50, description="Number of recommendations"),
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
-    redis_key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
-    user_vector_json = await redis_conn.get(redis_key)
-
-    if not (user_vector_json):
-        # cold start
-        raise HTTPException(  # TODO: return popular items instead
-            status_code=404, detail=f"User vector not found for ID: {user_id}"
-        )
+    recommendations = []
+    source = "personalized"
 
     try:
-        user_vector = json.loads(user_vector_json)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Corrupted vector data in Redis")
+        redis_key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
+        user_vector_json = await redis_conn.get(redis_key)
 
-    try:
-        search_result = await qdrant_conn.query_points(
-            collection_name=QDRANT_COLLECTION_NAME,
-            query=user_vector,
-            limit=k,
-            with_payload=True,
-        )
+        if user_vector_json:
+            user_vector = json.loads(user_vector_json)
+
+            search_result = await qdrant_conn.query_points(
+                collection_name=QDRANT_COLLECTION_NAME,
+                query=user_vector,
+                limit=k,
+                with_payload=True,
+            )
+
+            recommendations = [
+                RecommendationItem(
+                    item_id=point.id, score=point.score, metadata=point.payload or {}
+                )
+                for point in search_result.points
+            ]
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Vector search failed: {str(e)}")
+        logger.error(f"Personalized search failed for user {user_id}. Reason: {e}")
+        recommendations = []
 
-    recommendations = [
-        RecommendationItem(
-            item_id=point.id, score=point.score, metadata=point.payload or {}
+    if not recommendations:
+        source = "trending_now"
+        logger.info(f"Using fallback strategy for user {user_id}")
+
+        try:
+            popular_items_json = await redis_conn.get(REDIS_POPULAR_KEY)
+
+            if popular_items_json:
+                popular_items = json.loads(popular_items_json)
+                top_k_items = popular_items[:k]
+
+                recommendations = [
+                    RecommendationItem(
+                        item_id=item["item_id"],
+                        score=item["score"],
+                        metadata=item.get("metadata", {}),
+                    )
+                    for item in top_k_items
+                ]
+            else:
+                logger.warning(f"Fallback key '{REDIS_POPULAR_KEY}' is empty in Redis!")
+
+        except Exception as e:
+            logger.error(f"Fallback strategy failed: {e}")
+            recommendations = []
+
+    if not recommendations:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unavailable: No recommendations available (both personalized and fallback failed).",
         )
-        for point in search_result.points
-    ]
 
     return RecommendationResponse(
-        # TODO: handle source properly
         user_id=user_id,
-        source="personalized",
+        source=source,
         recommendations=recommendations,
     )
 
