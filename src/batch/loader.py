@@ -22,6 +22,8 @@ from src.config import (
 
 logger = setup_logging("loader.log")
 
+# TODO: possibly switch to pyspark here too
+
 
 def get_redis_client():
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
