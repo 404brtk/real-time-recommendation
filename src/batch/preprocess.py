@@ -1,6 +1,6 @@
+import os
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.ml.feature import StringIndexer
 from src.logging import setup_logging
 from src.config import (
     RAW_DIR,
@@ -35,72 +35,94 @@ def read_raw_data(spark):
     return df_customers, df_articles, df_transactions
 
 
-def build_user_mapping(df_customers, df_transactions):
-    logger.info("Building mapping for User ID")
-    user_indexer = StringIndexer(
-        inputCol="customer_id", outputCol="user_idx", handleInvalid="keep"
-    )
-    user_indexer_model = user_indexer.fit(df_transactions)
-    df_user_map = (
-        user_indexer_model.transform(df_customers.select("customer_id"))
-        .select("customer_id", "user_idx")
-        .distinct()
-    )
-    df_user_map.write.format("delta").mode("overwrite").save(
-        str(MAPPINGS_DIR / "user_map")
-    )
-    logger.info("User ID mapping saved to Delta Lake.")
-    return user_indexer_model
+# there is a problem with StringIndexer's metadata so we need to get around it
+# and create our own id mapping
+# TODO: investigate if there's a better way
+def generate_ids_distributed(spark, df_input, id_col, idx_col, start_idx=0):
+    rdd_ids = df_input.select(id_col).distinct().repartition(10).rdd.map(lambda r: r[0])
+    rdd_zipped = rdd_ids.zipWithIndex()
+    df_mapped = rdd_zipped.toDF([id_col, idx_col])
+    if start_idx > 0:
+        df_mapped = df_mapped.withColumn(idx_col, F.col(idx_col) + start_idx)
+    return df_mapped.withColumn(idx_col, F.col(idx_col).cast("integer"))
 
 
-def build_item_mapping(df_articles):
-    logger.info("Building mapping for Item ID")
-    # make sure article_id is string
-    df_articles = df_articles.withColumn(
+def get_or_create_mapping(spark, df_input, id_col_name, idx_col_name, mapping_path):
+    """
+    stateful mapping function.
+    ensures that existing ids keep their index, and only new ids get new indices.
+    """
+    logger.info(f"Handling mapping for: {id_col_name}")
+    path_str = str(mapping_path)
+    current_ids = df_input.select(id_col_name).distinct()
+
+    is_delta_exists = False
+    try:
+        if os.path.exists(path_str) and os.path.exists(
+            os.path.join(path_str, "_delta_log")
+        ):
+            is_delta_exists = True
+    except Exception:
+        pass
+
+    if not is_delta_exists:
+        logger.info(f"Creating NEW mapping table at {path_str}")
+
+        df_mapped = generate_ids_distributed(
+            spark, current_ids, id_col_name, idx_col_name, start_idx=0
+        )
+
+        df_mapped.write.format("delta").mode("overwrite").save(path_str)
+        return df_mapped
+
+    else:
+        logger.info(f"Updating EXISTING mapping at {path_str}")
+        existing_mapping = spark.read.format("delta").load(path_str)
+
+        new_ids_only = current_ids.join(
+            existing_mapping, on=id_col_name, how="left_anti"
+        )
+
+        if new_ids_only.count() == 0:
+            logger.info("No new IDs found. Using existing mapping.")
+            return existing_mapping
+
+        max_idx_row = existing_mapping.agg(F.max(idx_col_name)).collect()[0][0]
+        start_idx = (max_idx_row + 1) if max_idx_row is not None else 0
+
+        logger.info(f"Found new IDs. Appending starting from index {start_idx}...")
+
+        new_mapped = generate_ids_distributed(
+            spark, new_ids_only, id_col_name, idx_col_name, start_idx=start_idx
+        )
+
+        new_mapped.write.format("delta").mode("append").save(path_str)
+
+        return spark.read.format("delta").load(path_str)
+
+
+def transform_transactions(df_transactions, df_user_map, df_item_map):
+    logger.info("Transforming transactions...")
+
+    df_with_users = df_transactions.join(
+        F.broadcast(df_user_map), on="customer_id", how="inner"
+    )
+
+    df_with_users = df_with_users.withColumn(
         "article_id", F.col("article_id").cast("string")
     )
-    item_indexer = StringIndexer(
-        inputCol="article_id", outputCol="item_idx", handleInvalid="keep"
-    )
-    item_indexer_model = item_indexer.fit(df_articles)
-    df_item_map = (
-        item_indexer_model.transform(df_articles.select("article_id"))
-        .select("article_id", "item_idx")
-        .distinct()
-    )
-    df_item_map.write.format("delta").mode("overwrite").save(
-        str(MAPPINGS_DIR / "item_map")
-    )
-    logger.info("Item ID mapping saved to Delta Lake.")
-    return item_indexer_model
-
-
-def transform_transactions(df_transactions, user_indexer_model, item_indexer_model):
-    logger.info("Transforming transactions data...")
-    df_transactions_users = user_indexer_model.transform(df_transactions)
-    df_transactions_final = item_indexer_model.transform(df_transactions_users)
+    df_final = df_with_users.join(df_item_map, on="article_id", how="inner")
 
     df_interactions = (
-        df_transactions_final.groupBy("user_idx", "item_idx")
+        df_final.groupBy("user_idx", "item_idx")
         .agg(F.log1p(F.count("article_id")).alias("rating"))
-        .select("user_idx", "item_idx", "rating")
+        .select(
+            F.col("user_idx").cast("integer"),
+            F.col("item_idx").cast("integer"),
+            F.col("rating").cast("float"),
+        )
     )
-    df_interactions = (
-        df_interactions.withColumn("user_idx", F.col("user_idx").cast("integer"))
-        .withColumn("item_idx", F.col("item_idx").cast("integer"))
-        .withColumn("rating", F.col("rating").cast("float"))
-    )
-    logger.info(f"Number of interactions: {df_interactions.count()}")
     return df_interactions
-
-
-def save_processed_data(df_interactions):
-    df_interactions.write.format("delta").mode("overwrite").save(
-        str(PROCESSED_DIR / "train_data")
-    )
-    logger.info(
-        "Preprocessing completed successfully. Delta Lake tables ready at data/processed/"
-    )
 
 
 def main():
@@ -108,15 +130,27 @@ def main():
 
     df_customers, df_articles, df_transactions = read_raw_data(spark)
 
-    user_indexer_model = build_user_mapping(df_customers, df_transactions)
-    item_indexer_model = build_item_mapping(df_articles)
-
-    df_interactions = transform_transactions(
-        df_transactions, user_indexer_model, item_indexer_model
+    df_user_map = get_or_create_mapping(
+        spark, df_customers, "customer_id", "user_idx", MAPPINGS_DIR / "user_map"
+    )
+    df_articles = df_articles.withColumn(
+        "article_id", F.col("article_id").cast("string")
     )
 
-    save_processed_data(df_interactions)
+    df_item_map = get_or_create_mapping(
+        spark, df_articles, "article_id", "item_idx", MAPPINGS_DIR / "item_map"
+    )
 
+    df_train_data = transform_transactions(df_transactions, df_user_map, df_item_map)
+
+    count = df_train_data.count()
+    logger.info(f"Generated {count} interaction rows.")
+
+    df_train_data.write.format("delta").mode("overwrite").save(
+        str(PROCESSED_DIR / "train_data")
+    )
+
+    logger.info("ETL Pipeline Finished Successfully.")
     spark.stop()
 
 
