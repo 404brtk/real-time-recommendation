@@ -15,11 +15,13 @@ def create_spark_session():
     return (
         SparkSession.builder.appName("ETL")
         .config("spark.driver.memory", "8g")
+        .config("spark.jars.packages", "io.delta:delta-spark_2.13:4.0.0")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config(
             "spark.sql.catalog.spark_catalog",
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",
         )
+        .config("spark.sql.shuffle.partitions", "50")
         .master("local[*]")
         .getOrCreate()
     )
