@@ -13,6 +13,7 @@ def create_spark_session():
         SparkSession.builder.appName("ALS_Training")
         .config("spark.driver.memory", "8g")
         .config("spark.sql.shuffle.partitions", "200")
+        .config("spark.jars.packages", "io.delta:delta-spark_2.13:4.0.0")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config(
             "spark.sql.catalog.spark_catalog",
