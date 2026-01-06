@@ -26,12 +26,14 @@ logger = setup_logging("loader.log")
 def create_spark_session():
     return (
         SparkSession.builder.appName("Loader")
-        .config("spark.driver.memory", "4g")
+        .config("spark.driver.memory", "8g")
+        .config("spark.jars.packages", "io.delta:delta-spark_2.13:4.0.0")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config(
             "spark.sql.catalog.spark_catalog",
             "org.apache.spark.sql.delta.catalog.DeltaCatalog",
         )
+        .config("spark.sql.shuffle.partitions", "50")
         .master("local[*]")
         .getOrCreate()
     )
@@ -49,37 +51,39 @@ def load_users_to_redis(spark):
     logger.info("Loading Users from Delta Lake to Redis...")
     r = get_redis_client()
 
-    users_path = str(MODELS_DIR / "user_factors")
-    logger.info(f"Reading {users_path}...")
-    df_users = spark.read.format("delta").load(users_path)
+    try:
+        users_path = str(MODELS_DIR / "user_factors")
+        logger.info(f"Reading {users_path}...")
+        df_users = spark.read.format("delta").load(users_path)
 
-    # collect to driver and upload in batches
-    logger.info("Collecting user vectors...")
-    users_data = df_users.collect()
+        # collect to driver and upload in batches
+        logger.info("Collecting user vectors...")
+        users_data = df_users.collect()
 
-    logger.info(f"Uploading {len(users_data)} user vectors to Redis pipeline...")
+        logger.info(f"Uploading {len(users_data)} user vectors to Redis pipeline...")
 
-    # use pipeline for batch operations
-    pipe = r.pipeline()
-    batch_size = 10000
-    count = 0
+        # use pipeline for batch operations
+        pipe = r.pipeline()
+        batch_size = 10000
+        count = 0
 
-    for row in users_data:
-        user_id = row["id"]
-        vector = list(row["features"])
+        for row in users_data:
+            user_id = row["id"]
+            vector = list(row["features"])
 
-        key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
-        pipe.set(key, json.dumps(vector))
+            key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
+            pipe.set(key, json.dumps(vector))
 
-        count += 1
-        if count % batch_size == 0:
-            pipe.execute()
-            print(f"Uploaded {count} users...", end="\r")
+            count += 1
+            if count % batch_size == 0:
+                pipe.execute()
+                print(f"Uploaded {count} users...", end="\r")
 
-    pipe.execute()
-    logger.info(f"\nSuccessfully uploaded {count} user vectors to Redis.")
+        pipe.execute()
+        logger.info(f"Successfully uploaded {count} user vectors to Redis.")
 
-    r.close()
+    finally:
+        r.close()
 
 
 def load_items_to_qdrant(spark):
@@ -90,11 +94,12 @@ def load_items_to_qdrant(spark):
     df_vectors = spark.read.format("delta").load(str(MODELS_DIR / "item_factors"))
     # load mapping from article_id to item_idx
     df_map = spark.read.format("delta").load(str(MAPPINGS_DIR / "item_map"))
-    # make sure article_id is string
-    df_map = df_map.withColumn("article_id", df_map["article_id"].cast("string"))
 
     logger.info(f"Reading metadata from {RAW_DIR}...")
     df_meta = spark.read.format("delta").load(str(RAW_DIR / "articles"))
+
+    # ensure join keys are strings
+    df_map = df_map.withColumn("article_id", df_map["article_id"].cast("string"))
     df_meta = df_meta.withColumn("article_id", df_meta["article_id"].cast("string"))
 
     logger.info("Merging vectors with metadata...")
@@ -114,7 +119,7 @@ def load_items_to_qdrant(spark):
         "index_group_name",
     ]
 
-    # fill nulls and collect
+    # fill nulls just in case
     for col in payload_cols:
         df_full = df_full.fillna({col: ""})
 
