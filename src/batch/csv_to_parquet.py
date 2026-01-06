@@ -35,7 +35,7 @@ def convert_csv_to_parquet(spark):
 
 def main():
     spark = (
-        SparkSession.builder.appName("ETL")
+        SparkSession.builder.appName("CSV_to_Parquet")
         .config("spark.driver.memory", "2g")
         .master("local[*]")
         .getOrCreate()
