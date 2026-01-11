@@ -31,7 +31,29 @@ def read_raw_data(spark):
     logger.info("Reading RAW data from Delta Lake...")
     df_customers = spark.read.format("delta").load(str(RAW_DIR / "customers"))
     df_articles = spark.read.format("delta").load(str(RAW_DIR / "articles"))
+    
+    # load main historical transactions
     df_transactions = spark.read.format("delta").load(str(RAW_DIR / "transactions"))
+    
+    # try to load new streaming events if they exist
+    events_path = str(RAW_DIR / "events")
+    
+    try:
+        # check if delta table exists on disk
+        if os.path.exists(events_path) and os.path.exists(os.path.join(events_path, "_delta_log")):
+            logger.info(f"Found streaming events at {events_path}. Merging...")
+            df_events = spark.read.format("delta").load(events_path)
+            
+            df_transactions = df_transactions.unionByName(df_events, allowMissingColumns=True)
+            
+            logger.info(f"Merged successfully. Total rows: {df_transactions.count()}")
+        else:
+            logger.info("No streaming events found yet. Skipping merge.")
+            
+    except Exception as e:
+        # log warning but proceed with historical data only to not break the pipeline
+        logger.warning(f"Could not load events data. Error: {e}")
+
     return df_customers, df_articles, df_transactions
 
 
