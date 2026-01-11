@@ -21,5 +21,5 @@ QDRANT_COLLECTION_NAME = "items"
 VECTOR_SIZE = 32  # the same as in als rank
 
 # kafka
-KAFKA_BOOTSTRAP_SERVERS = ["localhost:9092"]
+KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 KAFKA_TOPIC_EVENTS = "user_events"
