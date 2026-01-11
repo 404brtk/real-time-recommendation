@@ -100,7 +100,7 @@ async def health_check(
 
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
 async def recommend(
-    user_id: str,
+    user_id: int,
     k: int = Query(10, gt=0, le=50, description="Number of recommendations"),
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
