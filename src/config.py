@@ -26,4 +26,4 @@ KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
 KAFKA_TOPIC_EVENTS = "user_events"
 
 # online learning
-LEARNING_RATE = 0.15
+LEARNING_RATE = 0.2
