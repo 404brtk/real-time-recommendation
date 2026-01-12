@@ -72,15 +72,24 @@ def main():
     # TODO: potentially update to use the same directory as transactions
     output_path = str(RAW_DIR / "events")
 
+    def log_batch(batch_df, batch_id):
+        count = batch_df.count()
+        if count > 0:
+            # get event type breakdown
+            event_counts = batch_df.groupBy("event_type").count().collect()
+            breakdown = ", ".join([f"{row['event_type']}: {row['count']}" for row in event_counts])
+            logger.info(f"Batch {batch_id}: Archived {count} events ({breakdown})")
+            batch_df.write.format("delta").mode("append").save(output_path)
+
     query = (
         df_transformed.writeStream
-        .format("delta")
-        .outputMode("append")
+        .foreachBatch(log_batch)
         .option("checkpointLocation", checkpoint_path)
-        .start(output_path)
+        .start()
     )
 
-    logger.info(f"Streaming events to: {output_path}...")
+    logger.info(f"Archiver ready. Listening for events...")
+    logger.info(f"Output path: {output_path}")
     query.awaitTermination()
 
 if __name__ == "__main__":
