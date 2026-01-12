@@ -141,7 +141,8 @@ def transform_transactions(df_transactions, df_user_map, df_item_map):
             F.when(F.col("event_type") == "purchase", 1.0)
              .when(F.col("event_type") == "add_to_cart", 0.5)
              .when(F.col("event_type") == "click", 0.1)
-             .otherwise(1.0)  # historical data without event_type - we can safely assume it's a purchase
+             .when(F.col("event_type").isNull(), 1.0) # historical data without event_type - we can safely assume it's a purchase
+             .otherwise(0.0) # ignore any different unknown event type 
         )).alias("rating"))
         .select(
             F.col("user_idx").cast("integer"),
