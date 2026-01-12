@@ -13,6 +13,8 @@ from src.config import (
     REDIS_PORT,
     REDIS_USER_VECTOR_PREFIX,
     REDIS_USER_HISTORY_PREFIX,
+    REDIS_DEBOUNCE_PREFIX,
+    DEBOUNCE_SECONDS,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
@@ -102,8 +104,13 @@ def main():
             if weight_multiplier is None:
                 continue
 
-            if event_type not in ["purchase", "click", "add_to_cart"]:
+            debounce_key = f"{REDIS_DEBOUNCE_PREFIX}{user_idx}:{item_idx}:{event_type}"
+
+            if r.exists(debounce_key):
+                logger.debug(f"Skipping duplicate: {user_idx}->{item_idx} ({event_type})")
                 continue
+
+            r.setex(debounce_key, DEBOUNCE_SECONDS, "1")
 
             logger.info(
                 f"Processing event: {event_type} | User: {user_idx} -> Item: {item_idx}"
