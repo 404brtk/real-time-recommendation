@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Response, Query, HTTPException, status
 import redis.asyncio as redis
 from qdrant_client import AsyncQdrantClient
+from qdrant_client.http import models
 import json
 import time
 
@@ -13,6 +14,7 @@ from src.config import (
     REDIS_HOST,
     REDIS_PORT,
     REDIS_USER_VECTOR_PREFIX,
+    REDIS_USER_HISTORY_PREFIX,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
@@ -109,17 +111,33 @@ async def recommend(
     source = "personalized"
 
     try:
-        redis_key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
-        user_vector_json = await redis_conn.get(redis_key)
+        redis_vector_key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
+        redis_history_key = f"{REDIS_USER_HISTORY_PREFIX}{user_id}"
+
+        async with redis_conn.pipeline() as pipe:
+            pipe.get(redis_vector_key)
+            pipe.zrange(redis_history_key, 0, -1) 
+            results = await pipe.execute()
+
+        user_vector_json, purchased_items_ids = results
 
         if user_vector_json:
             user_vector = json.loads(user_vector_json)
-
+            excluded_ids = [int(i) for i in purchased_items_ids] if purchased_items_ids else []
+            
+            query_filter = None
+            if excluded_ids:
+                query_filter = models.Filter(
+                    must_not=[
+                        models.HasIdCondition(has_id=excluded_ids)
+                    ]
+                )
             search_result = await qdrant_conn.query_points(
                 collection_name=QDRANT_COLLECTION_NAME,
                 query=user_vector,
                 limit=k,
                 with_payload=True,
+                query_filter=query_filter,
             )
 
             recommendations = [
@@ -165,7 +183,7 @@ async def recommend(
         )
 
     return RecommendationResponse(
-        user_id=user_id,
+        user_id=str(user_id),
         source=source,
         recommendations=recommendations,
     )

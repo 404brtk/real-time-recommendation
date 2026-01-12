@@ -12,6 +12,7 @@ RAW_DIR = DATA_DIR / "raw"
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_USER_VECTOR_PREFIX = "user:vector:"
+REDIS_USER_HISTORY_PREFIX = "user:history:"
 REDIS_POPULAR_KEY = "global:popular_items"
 
 # qdrant

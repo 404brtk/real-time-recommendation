@@ -3,6 +3,7 @@ import redis
 import numpy as np
 from kafka import KafkaConsumer
 from qdrant_client import QdrantClient
+import time
 
 from src.logging import setup_logging
 from src.config import (
@@ -11,6 +12,7 @@ from src.config import (
     REDIS_HOST,
     REDIS_PORT,
     REDIS_USER_VECTOR_PREFIX,
+    REDIS_USER_HISTORY_PREFIX,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
@@ -101,6 +103,22 @@ def main():
             
             save_user_vector(r, user_idx, new_user_vector)
             
+            # TODO: investigate different strategies for user history, how to manage it, maybe there's a better way
+            # if purchase, add item to user history
+            if event_type == 'purchase':
+                history_key = f"{REDIS_USER_HISTORY_PREFIX}{user_idx}"
+                current_time = int(time.time())
+                # zset (sorted set) where score is timestamp so we can keep only e.g. last n items or items from last n days
+                # kinda sliding window
+                # so we don't store everything in redis (ram)
+                r.zadd(history_key, {str(item_idx): current_time})
+
+                # keep only last 100 items
+                r.zremrangebyrank(history_key, 0, -101)
+
+                # also set expire to 1 year, so inactive users' history doesn't take up space
+                r.expire(history_key, 60 * 60 * 24 * 365)
+
             status = "UPDATED" if user_vector is not None else "CREATED (Cold Start)"
             logger.info(f"User {user_idx} vector {status} successfully.")
 
