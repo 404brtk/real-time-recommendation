@@ -62,7 +62,7 @@ def main():
         .withColumn("t_dat", to_date(from_unixtime(col("timestamp"))))
         .withColumn("price", lit(0.03)) # some average price - irrelevant in this case 
         .withColumn("sales_channel_id", lit(2)) # it's online system so we can safely assume sales_channel_id is always 2
-        .select("t_dat", "customer_id", "article_id", "price", "sales_channel_id")
+        .select("t_dat", "customer_id", "article_id", "price", "sales_channel_id", "event_type")
     )
 
     # we need checkpoint to keep track of processed events

@@ -137,7 +137,12 @@ def transform_transactions(df_transactions, df_user_map, df_item_map):
 
     df_interactions = (
         df_final.groupBy("user_idx", "item_idx")
-        .agg(F.log1p(F.count("article_id")).alias("rating"))
+        .agg(F.log1p(F.sum(
+            F.when(F.col("event_type") == "purchase", 1.0)
+             .when(F.col("event_type") == "add_to_cart", 0.5)
+             .when(F.col("event_type") == "click", 0.1)
+             .otherwise(1.0)  # historical data without event_type - we can safely assume it's a purchase
+        )).alias("rating"))
         .select(
             F.col("user_idx").cast("integer"),
             F.col("item_idx").cast("integer"),

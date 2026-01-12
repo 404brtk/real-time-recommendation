@@ -81,7 +81,7 @@ def main():
             # randomly select user and item
             user = random.choice(users_pool)
             item = random.choice(items_pool)
-            """
+
             # simulate event type with weighted probabilities
             # click (70%), add_to_cart (20%), purchase (10%)
             event_type = random.choices(
@@ -89,9 +89,6 @@ def main():
                 weights=[0.7, 0.2, 0.1],
                 k=1,
             )[0]
-            """
-            # TODO: update to support more event types
-            event_type = "purchase"  # for now only simulate purchases
 
             # send BOTH the raw IDs (for analytics/frontend) and internal indices (for the model)
             event = {
