@@ -17,6 +17,7 @@ from src.config import (
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
     LEARNING_RATE,
+    EVENT_WEIGHT_MULTIPLIERS,
 )
 
 logger = setup_logging("updater.log")
@@ -25,8 +26,10 @@ logger = setup_logging("updater.log")
 def get_redis_client():
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
+
 def get_qdrant_client():
     return QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
 
 def get_user_vector(r, user_idx):
     key = f"{REDIS_USER_VECTOR_PREFIX}{user_idx}"
@@ -35,16 +38,18 @@ def get_user_vector(r, user_idx):
         return np.array(json.loads(vector_str), dtype=np.float32)
     return None
 
+
 def save_user_vector(r, user_idx, vector):
     key = f"{REDIS_USER_VECTOR_PREFIX}{user_idx}"
     r.set(key, json.dumps(vector.tolist()))
+
 
 def get_item_vector(qdrant, item_idx):
     try:
         points = qdrant.retrieve(
             collection_name=QDRANT_COLLECTION_NAME,
             ids=[int(item_idx)],
-            with_vectors=True
+            with_vectors=True,
         )
         if points:
             return np.array(points[0].vector, dtype=np.float32)
@@ -52,33 +57,39 @@ def get_item_vector(qdrant, item_idx):
         logger.error(f"Error retrieving item {item_idx} from Qdrant: {e}")
     return None
 
-def calculate_new_vector(user_vector, item_vector):
+
+def calculate_new_vector(user_vector, item_vector, weight_multiplier):
     """
     move user vector towards item vector
     """
     # cold start: if user has no vector yet, then just use item vector as a starting point
     if user_vector is None:
         return item_vector
-    
+
+    effective_lr = LEARNING_RATE * weight_multiplier
+
     # apply exponential moving average to drift user profile towards the new item
-    new_vector = (user_vector * (1 - LEARNING_RATE)) + (item_vector * LEARNING_RATE)
+    new_vector = (user_vector * (1 - effective_lr)) + (item_vector * effective_lr)
     return new_vector
+
 
 def main():
     logger.info("Starting user profile updater (online learning)...")
-    
+
     r = get_redis_client()
     qdrant = get_qdrant_client()
-    
+
     consumer = KafkaConsumer(
         KAFKA_TOPIC_EVENTS,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         value_deserializer=lambda m: json.loads(m.decode("utf-8")),
         group_id="updater_group_v1",
-        auto_offset_reset="latest"
+        auto_offset_reset="latest",
     )
 
-    logger.info(f"Listening on topic '{KAFKA_TOPIC_EVENTS}' with learning rate {LEARNING_RATE}...")
+    logger.info(
+        f"Listening on topic '{KAFKA_TOPIC_EVENTS}' with learning rate {LEARNING_RATE}..."
+    )
 
     try:
         for message in consumer:
@@ -87,25 +98,35 @@ def main():
             item_idx = event.get("item_idx")
             event_type = event.get("event_type")
 
+            weight_multiplier = EVENT_WEIGHT_MULTIPLIERS.get(event_type)
+            if weight_multiplier is None:
+                continue
+
             if event_type not in ["purchase", "click", "add_to_cart"]:
                 continue
 
-            logger.info(f"Processing event: {event_type} | User: {user_idx} -> Item: {item_idx}")
+            logger.info(
+                f"Processing event: {event_type} | User: {user_idx} -> Item: {item_idx}"
+            )
 
             item_vector = get_item_vector(qdrant, item_idx)
             if item_vector is None:
-                logger.warning(f"Item {item_idx} not found in vector DB. Skipping update.")
+                logger.warning(
+                    f"Item {item_idx} not found in vector DB. Skipping update."
+                )
                 continue
 
             user_vector = get_user_vector(r, user_idx)
 
-            new_user_vector = calculate_new_vector(user_vector, item_vector)
-            
+            new_user_vector = calculate_new_vector(
+                user_vector, item_vector, weight_multiplier
+            )
+
             save_user_vector(r, user_idx, new_user_vector)
-            
+
             # TODO: investigate different strategies for user history, how to manage it, maybe there's a better way
             # if purchase, add item to user history
-            if event_type == 'purchase':
+            if event_type == "purchase":
                 history_key = f"{REDIS_USER_HISTORY_PREFIX}{user_idx}"
                 current_time = int(time.time())
                 # zset (sorted set) where score is timestamp so we can keep only e.g. last n items or items from last n days
@@ -127,6 +148,7 @@ def main():
     finally:
         consumer.close()
         r.close()
+
 
 if __name__ == "__main__":
     main()

@@ -27,3 +27,4 @@ KAFKA_TOPIC_EVENTS = "user_events"
 
 # online learning
 LEARNING_RATE = 0.2
+EVENT_WEIGHT_MULTIPLIERS = {"purchase": 1.0, "add_to_cart": 0.5, "click": 0.1}
