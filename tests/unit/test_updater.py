@@ -5,7 +5,6 @@ Tests the core vector calculation that drifts user profiles
 toward items they interact with.
 """
 
-import pytest
 import numpy as np
 
 from src.stream.updater import calculate_new_vector
@@ -23,7 +22,9 @@ class TestCalculateNewVector:
         user_vector = None
         weight_multiplier = 1.0
 
-        result = calculate_new_vector(user_vector, sample_item_vector, weight_multiplier)
+        result = calculate_new_vector(
+            user_vector, sample_item_vector, weight_multiplier
+        )
 
         # Should return exactly the item vector for cold start
         np.testing.assert_array_equal(result, sample_item_vector)
@@ -54,10 +55,14 @@ class TestCalculateNewVector:
         item_vector = np.array([0.0, 1.0], dtype=np.float32)
 
         # Simulate a click (low weight)
-        click_result = calculate_new_vector(user_vector, item_vector, weight_multiplier=0.1)
+        click_result = calculate_new_vector(
+            user_vector, item_vector, weight_multiplier=0.1
+        )
 
         # Simulate a purchase (high weight)
-        purchase_result = calculate_new_vector(user_vector, item_vector, weight_multiplier=1.0)
+        purchase_result = calculate_new_vector(
+            user_vector, item_vector, weight_multiplier=1.0
+        )
 
         # Purchase should move the vector more toward the item
         # Check that purchase result is closer to item_vector than click result

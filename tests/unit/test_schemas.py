@@ -5,9 +5,6 @@ Validates serialization, validation, and edge cases for
 request/response models.
 """
 
-import pytest
-from pydantic import ValidationError
-
 from src.serve.schemas import RecommendationItem, RecommendationResponse
 
 
@@ -117,7 +114,9 @@ class TestRecommendationResponse:
             user_id=42,
             source="personalized",
             recommendations=[
-                RecommendationItem(item_id=100, score=0.95, metadata={"name": "Product A"}),
+                RecommendationItem(
+                    item_id=100, score=0.95, metadata={"name": "Product A"}
+                ),
             ],
         )
 

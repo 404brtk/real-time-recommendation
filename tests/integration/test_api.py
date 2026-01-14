@@ -11,7 +11,6 @@ from unittest.mock import AsyncMock, MagicMock
 from httpx import AsyncClient, ASGITransport
 
 from src.serve.api import app
-from src.serve.schemas import RecommendationItem
 
 
 @pytest.fixture
