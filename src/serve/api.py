@@ -1,10 +1,13 @@
 from contextlib import asynccontextmanager
+from typing import Any
 from fastapi import FastAPI, Depends, Response, Query, HTTPException, status
 import redis.asyncio as redis
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models
 import json
 import time
+import numpy as np
+from kafka import KafkaProducer
 
 from src.logging import setup_logging
 from src.observability import setup_metrics, setup_tracing, metrics
@@ -16,30 +19,78 @@ from src.config import (
     REDIS_PORT,
     REDIS_USER_VECTOR_PREFIX,
     REDIS_USER_HISTORY_PREFIX,
+    REDIS_USER_MAP_PREFIX,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
     REDIS_POPULAR_KEY,
+    KAFKA_BOOTSTRAP_SERVERS,
+    KAFKA_TOPIC_EVENTS,
 )
 
-from src.serve.schemas import RecommendationItem, RecommendationResponse
+from src.serve.schemas import RecommendationItem, RecommendationResponse, PurchaseEvent
 
 logger = setup_logging("api.log")
+
+
+def compute_diversity(vectors: list[Any]) -> float:
+    """
+    compute intra-list diversity as average pairwise cosine distance.
+
+    returns a value between 0 (all identical) and 2 (all opposite).
+    higher values indicate more diverse recommendations.
+    """
+    if len(vectors) < 2:
+        return 0.0
+
+    vectors_np = np.array(vectors, dtype=np.float32)
+    # normalize vectors for cosine similarity
+    norms = np.linalg.norm(vectors_np, axis=1, keepdims=True)
+    norms[norms == 0] = 1  # avoid division by zero
+    normalized = vectors_np / norms
+
+    # compute pairwise cosine similarities
+    similarity_matrix = np.dot(normalized, normalized.T)
+
+    # extract upper triangle (excluding diagonal) and convert to distances
+    n = len(vectors)
+    total_distance = 0.0
+    count = 0
+    for i in range(n):
+        for j in range(i + 1, n):
+            total_distance += 1 - similarity_matrix[i, j]  # cosine distance
+            count += 1
+
+    return total_distance / count if count > 0 else 0.0
 
 
 @asynccontextmanager  # thanks to this the app knows when to execute code before and after yield
 async def lifespan(app: FastAPI):
     # during startup - before handling requests
-    logger.info("Initializing DB connections...")
+    logger.info("Initializing connections...")
     app.state.redis_client = redis.Redis(
         host=REDIS_HOST, port=REDIS_PORT, decode_responses=True
     )
     app.state.qdrant_client = AsyncQdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+
+    # initialize kafka producer for purchase events
+    try:
+        app.state.kafka_producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda x: json.dumps(x).encode("utf-8"),
+        )
+        logger.info("Kafka producer initialized")
+    except Exception as e:
+        logger.warning(f"Kafka producer failed to initialize: {e}")
+        app.state.kafka_producer = None
+
     yield
     # when the app finishes handling requests - right before shutdown
-    logger.info("Closing DB connections...")
+    logger.info("Closing connections...")
     await app.state.redis_client.aclose()
     await app.state.qdrant_client.close()
+    if app.state.kafka_producer:
+        app.state.kafka_producer.close()
 
 
 app = FastAPI(title="RecommendationSystemAPI", lifespan=lifespan)
@@ -56,7 +107,6 @@ async def health_check_live():
 @app.get("/health/ready")
 async def health_check(
     response: Response,
-    # dependency injection
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
@@ -104,20 +154,21 @@ async def health_check(
     return health_status
 
 
-@app.get("/recommend/{user_id}", response_model=RecommendationResponse)
+@app.get("/recommend/{user_idx}", response_model=RecommendationResponse)
 async def recommend(
-    user_id: int,
+    user_idx: int,
     k: int = Query(10, gt=0, le=50, description="Number of recommendations"),
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
     recommendations = []
+    item_vectors = []  # for diversity calculation
     source = "personalized"
     user_type = "known"
 
     try:
-        redis_vector_key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
-        redis_history_key = f"{REDIS_USER_HISTORY_PREFIX}{user_id}"
+        redis_vector_key = f"{REDIS_USER_VECTOR_PREFIX}{user_idx}"
+        redis_history_key = f"{REDIS_USER_HISTORY_PREFIX}{user_idx}"
 
         # track redis operation timing
         redis_start = time.time()
@@ -154,21 +205,30 @@ async def recommend(
                 query=user_vector,
                 limit=k,
                 with_payload=True,
+                with_vectors=True,  # need vectors for diversity calculation
                 query_filter=query_filter,
             )
             metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
 
             recommendations = [
                 RecommendationItem(
-                    item_id=point.id, score=point.score, metadata=point.payload or {}
+                    item_idx=int(point.id),
+                    score=point.score,
+                    metadata=point.payload or {},
                 )
                 for point in search_result.points
             ]
+
+            # collect vectors for diversity calculation
+            item_vectors = [
+                list(point.vector) for point in search_result.points if point.vector
+            ]
+
         else:
             user_type = "cold_start"
 
     except Exception as e:
-        logger.error(f"Personalized search failed for user {user_id}. Reason: {e}")
+        logger.error(f"Personalized search failed for user {user_idx}. Reason: {e}")
         metrics.recommendation_fallback.labels(reason="personalized_error").inc()
         recommendations = []
 
@@ -179,7 +239,7 @@ async def recommend(
         elif not recommendations:
             metrics.recommendation_fallback.labels(reason="no_results").inc()
 
-        logger.info(f"Using fallback strategy for user {user_id}")
+        logger.info(f"Using fallback strategy for user {user_idx}")
 
         try:
             redis_start = time.time()
@@ -194,12 +254,13 @@ async def recommend(
 
                 recommendations = [
                     RecommendationItem(
-                        item_id=item["item_id"],
+                        item_idx=item["item_idx"],
                         score=item["score"],
                         metadata=item.get("metadata", {}),
                     )
                     for item in top_k_items
                 ]
+                # no vectors available for trending items, diversity will be skipped
             else:
                 logger.warning(f"Fallback key '{REDIS_POPULAR_KEY}' is empty in Redis!")
 
@@ -215,11 +276,120 @@ async def recommend(
 
     metrics.recommendation_requests.labels(source=source, user_type=user_type).inc()
 
+    # compute and record diversity score (only for personalized with vectors)
+    if item_vectors and len(item_vectors) >= 2:
+        diversity = compute_diversity(item_vectors)
+        metrics.recommendation_diversity.observe(diversity)
+
     return RecommendationResponse(
-        user_id=user_id,
+        user_idx=user_idx,
         source=source,
         recommendations=recommendations,
     )
+
+
+@app.post("/events/purchase")
+async def record_purchase(
+    event: PurchaseEvent,
+    redis_conn: redis.Redis = Depends(get_redis_client),
+    qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
+):
+    """
+    record a purchase event. publishes to kafka for the stream updater to process.
+
+    The updater will:
+    1. Update the user's vector (moving it towards the purchased item)
+    2. Add the item to the user's purchase history (excluded from future recommendations)
+
+    The archiver will:
+    1. Archive the full event to Delta Lake for batch retraining
+
+    Note: Requires the stream updater to be running to see effect on recommendations.
+    """
+    if not app.state.kafka_producer:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Kafka producer not available. Cannot record purchase.",
+        )
+
+    # look up external IDs for archiver compatibility
+    # get customer_id from Redis user mapping
+    user_map_key = f"{REDIS_USER_MAP_PREFIX}{event.user_idx}"
+    customer_id = await redis_conn.get(user_map_key)
+    if not customer_id:
+        metrics.purchase_lookup_errors.labels(error_type="user_not_found").inc()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User mapping not found for user_idx={event.user_idx}",
+        )
+
+    # get article_id from Qdrant payload
+    try:
+        points = await qdrant_conn.retrieve(
+            collection_name=QDRANT_COLLECTION_NAME,
+            ids=[event.item_idx],
+            with_payload=True,
+        )
+        if not points:
+            metrics.purchase_lookup_errors.labels(error_type="item_not_found").inc()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Item not found for item_idx={event.item_idx}",
+            )
+        payload = points[0].payload
+        if not payload:
+            metrics.purchase_lookup_errors.labels(error_type="item_not_found").inc()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Payload not found for item_idx={event.item_idx}",
+            )
+        article_id = payload.get("article_id")
+        if not article_id:
+            metrics.purchase_lookup_errors.labels(error_type="item_not_found").inc()
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"article_id not found in payload for item_idx={event.item_idx}",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        metrics.purchase_lookup_errors.labels(error_type="qdrant_error").inc()
+        logger.error(f"Failed to retrieve item from Qdrant: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to look up item: {e}",
+        )
+
+    kafka_event = {
+        "user_id": customer_id,  # external ID for archiver
+        "user_idx": event.user_idx,  # internal ID
+        "item_id": article_id,  # external ID for archiver
+        "item_idx": event.item_idx,  # internal ID
+        "event_type": "purchase",
+        "timestamp": time.time(),
+        "quantity": 1,
+    }
+
+    try:
+        app.state.kafka_producer.send(KAFKA_TOPIC_EVENTS, value=kafka_event)
+        metrics.purchase_events_accepted.inc()
+        logger.info(
+            f"Purchase event sent: user_idx={event.user_idx}, item_idx={event.item_idx}, "
+            f"customer_id={customer_id}, article_id={article_id}"
+        )
+    except Exception as e:
+        metrics.purchase_lookup_errors.labels(error_type="kafka_error").inc()
+        logger.error(f"Failed to send purchase event: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to record purchase: {e}",
+        )
+
+    return {
+        "status": "accepted",
+        "message": "Purchase event sent to processing queue",
+        "event": kafka_event,
+    }
 
 
 if __name__ == "__main__":
