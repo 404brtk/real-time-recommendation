@@ -10,6 +10,7 @@ from src.config import (
     REDIS_HOST,
     REDIS_PORT,
     REDIS_USER_VECTOR_PREFIX,
+    REDIS_USER_MAP_PREFIX,
     QDRANT_HOST,
     QDRANT_PORT,
     QDRANT_COLLECTION_NAME,
@@ -81,6 +82,46 @@ def load_users_to_redis(spark):
 
         pipe.execute()
         logger.info(f"Successfully uploaded {count} user vectors to Redis.")
+
+    finally:
+        r.close()
+
+
+def load_user_mapping_to_redis(spark):
+    """load user_idx -> customer_id mapping to Redis for reverse lookups."""
+    logger.info("Loading user mapping from Delta Lake to Redis...")
+    r = get_redis_client()
+
+    try:
+        user_map_path = str(MAPPINGS_DIR / "user_map")
+        logger.info(f"Reading {user_map_path}...")
+        df_user_map = spark.read.format("delta").load(user_map_path)
+
+        logger.info("Collecting user mappings...")
+        user_map_data = df_user_map.collect()
+
+        logger.info(
+            f"Uploading {len(user_map_data)} user mappings to Redis pipeline..."
+        )
+
+        pipe = r.pipeline()
+        batch_size = 10000
+        count = 0
+
+        for row in user_map_data:
+            user_idx = row["user_idx"]
+            customer_id = row["customer_id"]
+
+            key = f"{REDIS_USER_MAP_PREFIX}{user_idx}"
+            pipe.set(key, customer_id)
+
+            count += 1
+            if count % batch_size == 0:
+                pipe.execute()
+                print(f"Uploaded {count} user mappings...", end="\r")
+
+        pipe.execute()
+        logger.info(f"Successfully uploaded {count} user mappings to Redis.")
 
     finally:
         r.close()
@@ -169,6 +210,7 @@ def main():
     spark = create_spark_session()
     try:
         load_users_to_redis(spark)
+        load_user_mapping_to_redis(spark)
         load_items_to_qdrant(spark)
         logger.info("Loader finished successfully!")
     except Exception as e:
