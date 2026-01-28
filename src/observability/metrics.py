@@ -65,6 +65,13 @@ class Metrics:
             "Number of user vectors in Redis (approximate)",
         )
 
+        # recommendation quality metrics
+        self.recommendation_diversity = Histogram(
+            "recommendation_diversity_score",
+            "Intra-list diversity of recommendations (avg pairwise cosine distance)",
+            buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
+        )
+
 
 # singleton instance
 metrics = Metrics()
