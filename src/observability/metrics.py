@@ -72,6 +72,20 @@ class Metrics:
             buckets=(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
         )
 
+        # purchase endpoint metrics
+        self.purchase_events_accepted = Counter(
+            "purchase_events_accepted_total",
+            "Purchase events successfully sent to Kafka",
+        )
+
+        self.purchase_lookup_errors = Counter(
+            "purchase_lookup_errors_total",
+            "Errors during purchase event ID lookups",
+            [
+                "error_type"
+            ],  # "user_not_found", "item_not_found", "qdrant_error", "kafka_error"
+        )
+
 
 # singleton instance
 metrics = Metrics()
