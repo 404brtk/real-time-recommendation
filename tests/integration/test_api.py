@@ -32,6 +32,7 @@ def mock_qdrant_point():
     point.id = 123
     point.score = 0.95
     point.payload = {"article_id": "0123456789", "prod_name": "Test Product"}
+    point.vector = [0.1] * 32  # Mock vector for diversity calculation
     return point
 
 
@@ -111,7 +112,7 @@ class TestHealthEndpoints:
 
 
 class TestRecommendEndpoint:
-    """Tests for the /recommend/{user_id} endpoint."""
+    """Tests for the /recommend/{user_idx} endpoint."""
 
     @pytest.fixture(autouse=True)
     async def setup_app(self, mock_async_redis, mock_async_qdrant, mock_redis_pipeline):
@@ -141,7 +142,7 @@ class TestRecommendEndpoint:
         data = response.json()
         assert data["source"] == "personalized"
         assert len(data["recommendations"]) == 1
-        assert data["recommendations"][0]["item_id"] == 123
+        assert data["recommendations"][0]["item_idx"] == 123
 
     async def test_recommend_fallback_to_trending(self, sample_popular_items):
         """Should fall back to trending items when user has no vector."""

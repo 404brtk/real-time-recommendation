@@ -111,7 +111,7 @@ def sample_popular_items():
     """Sample trending items as stored in Redis."""
     return [
         {
-            "item_id": 1,
+            "item_idx": 1,
             "score": 100.0,
             "metadata": {
                 "article_id": "0123456789",
@@ -122,7 +122,7 @@ def sample_popular_items():
             "source": "trending_now",
         },
         {
-            "item_id": 2,
+            "item_idx": 2,
             "score": 90.0,
             "metadata": {
                 "article_id": "0987654321",
