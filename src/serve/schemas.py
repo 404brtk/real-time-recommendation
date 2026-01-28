@@ -9,6 +9,6 @@ class RecommendationItem(BaseModel):
 
 
 class RecommendationResponse(BaseModel):
-    user_id: int
+    user_id: int | str
     source: str
     recommendations: List[RecommendationItem]
