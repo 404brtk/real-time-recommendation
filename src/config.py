@@ -13,6 +13,7 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_USER_VECTOR_PREFIX = "user:vector:"
 REDIS_USER_HISTORY_PREFIX = "user:history:"
+REDIS_USER_MAP_PREFIX = "user:map:"  # user_idx -> customer_id mapping
 REDIS_POPULAR_KEY = "global:popular_items"
 REDIS_DEBOUNCE_PREFIX = "debounce:"
 DEBOUNCE_SECONDS = 300  # 5 minutes
