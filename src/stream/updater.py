@@ -5,7 +5,10 @@ from kafka import KafkaConsumer
 from qdrant_client import QdrantClient
 import time
 
+from prometheus_client import start_http_server
+
 from src.logging import setup_logging
+from src.observability.metrics import metrics
 from src.config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPIC_EVENTS,
@@ -23,6 +26,9 @@ from src.config import (
 )
 
 logger = setup_logging("updater.log")
+
+METRICS_PORT = 8001  # new port for updater metrics,
+# we need to separate them from api metrics
 
 
 def get_redis_client():
@@ -78,6 +84,10 @@ def calculate_new_vector(user_vector, item_vector, weight_multiplier):
 def main():
     logger.info("Starting user profile updater (online learning)...")
 
+    # start prometheus metrics server on separate port
+    start_http_server(METRICS_PORT)
+    logger.info(f"Metrics server started on port {METRICS_PORT}")
+
     r = get_redis_client()
     qdrant = get_qdrant_client()
 
@@ -104,10 +114,15 @@ def main():
             if weight_multiplier is None:
                 continue
 
+            process_start = time.time()
+
             debounce_key = f"{REDIS_DEBOUNCE_PREFIX}{user_idx}:{item_idx}:{event_type}"
 
             if r.exists(debounce_key):
-                logger.debug(f"Skipping duplicate: {user_idx}->{item_idx} ({event_type})")
+                logger.debug(
+                    f"Skipping duplicate: {user_idx}->{item_idx} ({event_type})"
+                )
+                metrics.debounce_hits.inc()
                 continue
 
             r.setex(debounce_key, DEBOUNCE_SECONDS, "1")
@@ -124,6 +139,7 @@ def main():
                 continue
 
             user_vector = get_user_vector(r, user_idx)
+            is_cold_start = user_vector is None
 
             new_user_vector = calculate_new_vector(
                 user_vector, item_vector, weight_multiplier
@@ -147,7 +163,16 @@ def main():
                 # also set expire to 1 year, so inactive users' history doesn't take up space
                 r.expire(history_key, 60 * 60 * 24 * 365)
 
-            status = "UPDATED" if user_vector is not None else "CREATED (Cold Start)"
+            process_duration = time.time() - process_start
+            metrics.events_processed.labels(event_type=event_type).inc()
+            metrics.event_processing_duration.labels(event_type=event_type).observe(
+                process_duration
+            )
+            metrics.user_vector_updates.labels(
+                type="created" if is_cold_start else "updated"
+            ).inc()
+
+            status = "UPDATED" if not is_cold_start else "CREATED (Cold Start)"
             logger.info(f"User {user_idx} vector {status} successfully.")
 
     except KeyboardInterrupt:

@@ -7,6 +7,7 @@ import json
 import time
 
 from src.logging import setup_logging
+from src.observability import setup_metrics, setup_tracing, metrics
 
 from src.serve.dependencies import get_redis_client, get_qdrant_client
 
@@ -42,6 +43,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="RecommendationSystemAPI", lifespan=lifespan)
+
+setup_metrics(app)
+setup_tracing(app)
 
 
 @app.get("/health/live")
@@ -109,29 +113,42 @@ async def recommend(
 ):
     recommendations = []
     source = "personalized"
+    user_type = "known"
 
     try:
         redis_vector_key = f"{REDIS_USER_VECTOR_PREFIX}{user_id}"
         redis_history_key = f"{REDIS_USER_HISTORY_PREFIX}{user_id}"
 
+        # track redis operation timing
+        redis_start = time.time()
         async with redis_conn.pipeline() as pipe:
             pipe.get(redis_vector_key)
-            pipe.zrange(redis_history_key, 0, -1) 
+            pipe.zrange(redis_history_key, 0, -1)
             results = await pipe.execute()
+        metrics.redis_operation_duration.labels(operation="pipeline_get").observe(
+            time.time() - redis_start
+        )
 
         user_vector_json, purchased_items_ids = results
 
         if user_vector_json:
             user_vector = json.loads(user_vector_json)
-            excluded_ids = [int(i) for i in purchased_items_ids] if purchased_items_ids else []
-            
+            excluded_ids = (
+                [int(i) for i in purchased_items_ids] if purchased_items_ids else []
+            )
+
+            # track excluded items
+            if excluded_ids:
+                metrics.items_excluded.inc(len(excluded_ids))
+
             query_filter = None
             if excluded_ids:
                 query_filter = models.Filter(
-                    must_not=[
-                        models.HasIdCondition(has_id=excluded_ids)
-                    ]
+                    must_not=[models.HasIdCondition(has_id=excluded_ids)]
                 )
+
+            # track qdrant search timing
+            qdrant_start = time.time()
             search_result = await qdrant_conn.query_points(
                 collection_name=QDRANT_COLLECTION_NAME,
                 query=user_vector,
@@ -139,6 +156,7 @@ async def recommend(
                 with_payload=True,
                 query_filter=query_filter,
             )
+            metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
 
             recommendations = [
                 RecommendationItem(
@@ -146,16 +164,29 @@ async def recommend(
                 )
                 for point in search_result.points
             ]
+        else:
+            user_type = "cold_start"
+
     except Exception as e:
         logger.error(f"Personalized search failed for user {user_id}. Reason: {e}")
+        metrics.recommendation_fallback.labels(reason="personalized_error").inc()
         recommendations = []
 
     if not recommendations:
         source = "trending_now"
+        if user_type == "cold_start":
+            metrics.recommendation_fallback.labels(reason="cold_start").inc()
+        elif not recommendations:
+            metrics.recommendation_fallback.labels(reason="no_results").inc()
+
         logger.info(f"Using fallback strategy for user {user_id}")
 
         try:
+            redis_start = time.time()
             popular_items_json = await redis_conn.get(REDIS_POPULAR_KEY)
+            metrics.redis_operation_duration.labels(operation="get_popular").observe(
+                time.time() - redis_start
+            )
 
             if popular_items_json:
                 popular_items = json.loads(popular_items_json)
@@ -182,8 +213,10 @@ async def recommend(
             detail="Service unavailable: No recommendations available (both personalized and fallback failed).",
         )
 
+    metrics.recommendation_requests.labels(source=source, user_type=user_type).inc()
+
     return RecommendationResponse(
-        user_id=str(user_id),
+        user_id=user_id,
         source=source,
         recommendations=recommendations,
     )
