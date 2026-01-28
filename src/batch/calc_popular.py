@@ -124,7 +124,7 @@ def main():
         row_dict = row.asDict()
         payload.append(
             {
-                "item_id": row_dict["item_idx"],
+                "item_idx": row_dict["item_idx"],
                 "score": float(row_dict["score"]),
                 "metadata": {
                     "article_id": row_dict["article_id"],
