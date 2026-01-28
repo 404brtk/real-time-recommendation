@@ -1,0 +1,87 @@
+from prometheus_client import Counter, Histogram, Gauge
+
+
+class Metrics:
+    def __init__(self):
+        # api metrics
+        self.recommendation_requests = Counter(
+            "recommendation_requests_total",
+            "Total recommendation requests",
+            ["source", "user_type"],
+        )
+
+        self.recommendation_fallback = Counter(
+            "recommendation_fallback_total",
+            "Fallback to trending recommendations",
+            ["reason"],
+        )
+
+        self.items_excluded = Counter(
+            "items_excluded_total",
+            "Items excluded from recommendations (already purchased)",
+        )
+
+        self.redis_operation_duration = Histogram(
+            "redis_operation_duration_seconds",
+            "Redis operation latency",
+            ["operation"],
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+        )
+
+        self.qdrant_search_duration = Histogram(
+            "qdrant_search_duration_seconds",
+            "Qdrant vector search latency",
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+        )
+
+        # stream processor metrics
+        self.events_processed = Counter(
+            "events_processed_total",
+            "Events processed by updater",
+            ["event_type"],
+        )
+
+        self.event_processing_duration = Histogram(
+            "event_processing_duration_seconds",
+            "Event processing latency",
+            ["event_type"],
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5),
+        )
+
+        self.debounce_hits = Counter(
+            "debounce_hits_total",
+            "Duplicate events skipped due to debounce",
+        )
+
+        self.user_vector_updates = Counter(
+            "user_vector_updates_total",
+            "User vector updates",
+            ["type"],  # "created" or "updated"
+        )
+
+        # gauge for active connections/state
+        self.active_user_vectors = Gauge(
+            "active_user_vectors",
+            "Number of user vectors in Redis (approximate)",
+        )
+
+
+# singleton instance
+metrics = Metrics()
+
+
+def setup_metrics(app):
+    """
+    setup prometheus metrics instrumentation for fastapi.
+    it auto-instruments all http endpoints with request count/latency.
+    """
+    from prometheus_fastapi_instrumentator import Instrumentator
+
+    instrumentator = Instrumentator(
+        should_group_status_codes=True,
+        should_ignore_untemplated=True,
+        should_respect_env_var=False,
+        excluded_handlers=["/health/live", "/health/ready", "/metrics"],
+    )
+
+    instrumentator.instrument(app).expose(app, include_in_schema=False)
