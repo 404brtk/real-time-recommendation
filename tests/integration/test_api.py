@@ -214,3 +214,270 @@ class TestRecommendEndpoint:
         # Verify Qdrant was called with filter to exclude purchased items
         call_args = self.qdrant.query_points.call_args
         assert call_args.kwargs.get("query_filter") is not None
+
+
+# -----------------------------------------------------------------------------
+# Purchase Event Endpoint Tests
+# -----------------------------------------------------------------------------
+
+
+class TestPurchaseEventEndpoint:
+    """Tests for the POST /events/purchase endpoint."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_app(self, mock_async_redis, mock_async_qdrant):
+        """Set up app state with mocked clients."""
+        app.state.redis_client = mock_async_redis
+        app.state.qdrant_client = mock_async_qdrant
+        app.state.kafka_producer = MagicMock()
+        self.redis = mock_async_redis
+        self.qdrant = mock_async_qdrant
+        self.kafka = app.state.kafka_producer
+        yield
+
+    async def test_purchase_event_success(self):
+        """Should accept valid purchase event and send to Kafka."""
+        # User mapping exists
+        self.redis.get.return_value = "customer_abc123"
+
+        # Item exists in Qdrant with article_id
+        item_point = MagicMock()
+        item_point.payload = {"article_id": "0123456789", "prod_name": "Test Product"}
+        self.qdrant.retrieve.return_value = [item_point]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42, "item_idx": 100},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "accepted"
+        assert data["event"]["user_idx"] == 42
+        assert data["event"]["item_idx"] == 100
+        assert data["event"]["user_id"] == "customer_abc123"
+        assert data["event"]["item_id"] == "0123456789"
+        assert data["event"]["event_type"] == "purchase"
+
+        # Verify Kafka send was called
+        self.kafka.send.assert_called_once()
+
+    async def test_purchase_event_user_not_found(self):
+        """Should return 404 when user mapping doesn't exist."""
+        self.redis.get.return_value = None  # No user mapping
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 99999, "item_idx": 100},
+            )
+
+        assert response.status_code == 404
+        assert "user mapping not found" in response.json()["detail"].lower()
+
+    async def test_purchase_event_item_not_found(self):
+        """Should return 404 when item doesn't exist in Qdrant."""
+        self.redis.get.return_value = "customer_abc123"
+        self.qdrant.retrieve.return_value = []  # No item found
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42, "item_idx": 99999},
+            )
+
+        assert response.status_code == 404
+        assert "item not found" in response.json()["detail"].lower()
+
+    async def test_purchase_event_item_missing_article_id(self):
+        """Should return 404 when item has no article_id in payload."""
+        self.redis.get.return_value = "customer_abc123"
+
+        item_point = MagicMock()
+        item_point.payload = {"prod_name": "Test Product"}  # No article_id
+        self.qdrant.retrieve.return_value = [item_point]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42, "item_idx": 100},
+            )
+
+        assert response.status_code == 404
+        assert "article_id not found" in response.json()["detail"].lower()
+
+    async def test_purchase_event_kafka_unavailable(self):
+        """Should return 503 when Kafka producer is not available."""
+        app.state.kafka_producer = None
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42, "item_idx": 100},
+            )
+
+        assert response.status_code == 503
+        assert "kafka" in response.json()["detail"].lower()
+
+    async def test_purchase_event_kafka_send_failure(self):
+        """Should return 500 when Kafka send fails."""
+        self.redis.get.return_value = "customer_abc123"
+
+        item_point = MagicMock()
+        item_point.payload = {"article_id": "0123456789"}
+        self.qdrant.retrieve.return_value = [item_point]
+
+        # Kafka send raises exception
+        self.kafka.send.side_effect = Exception("Kafka connection lost")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42, "item_idx": 100},
+            )
+
+        assert response.status_code == 500
+        assert "failed to record purchase" in response.json()["detail"].lower()
+
+    async def test_purchase_event_qdrant_error(self):
+        """Should return 500 when Qdrant retrieve fails."""
+        self.redis.get.return_value = "customer_abc123"
+        self.qdrant.retrieve.side_effect = Exception("Qdrant connection error")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42, "item_idx": 100},
+            )
+
+        assert response.status_code == 500
+        assert "failed to look up item" in response.json()["detail"].lower()
+
+    async def test_purchase_event_invalid_payload(self):
+        """Should return 422 for invalid request payload."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": "not_an_int", "item_idx": 100},
+            )
+
+        assert response.status_code == 422
+
+    async def test_purchase_event_missing_fields(self):
+        """Should return 422 when required fields are missing."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/events/purchase",
+                json={"user_idx": 42},  # Missing item_idx
+            )
+
+        assert response.status_code == 422
+
+
+# -----------------------------------------------------------------------------
+# Similar Items Endpoint Tests
+# -----------------------------------------------------------------------------
+
+
+class TestSimilarItemsEndpoint:
+    """Tests for the /items/{item_idx}/similar endpoint."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_app(self, mock_async_redis, mock_async_qdrant):
+        """Set up app state with mocked clients."""
+        app.state.redis_client = mock_async_redis
+        app.state.qdrant_client = mock_async_qdrant
+        self.qdrant = mock_async_qdrant
+        yield
+
+    async def test_similar_items_success(self, mock_qdrant_point):
+        """Should return similar items when source item exists."""
+        # Source item exists in Qdrant
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {"article_id": "1111111111", "prod_name": "Source Item"}
+        self.qdrant.retrieve.return_value = [source_point]
+
+        # Similar items returned by search
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source_item_idx"] == 100
+        assert data["source_metadata"]["prod_name"] == "Source Item"
+        assert len(data["similar_items"]) == 1
+        assert data["similar_items"][0]["item_idx"] == 123
+
+    async def test_similar_items_not_found(self):
+        """Should return 404 when source item doesn't exist."""
+        self.qdrant.retrieve.return_value = []
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/99999/similar")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    async def test_similar_items_with_product_group_filter(self, mock_qdrant_point):
+        """Should filter by product_group when specified."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar?product_group=Accessories")
+
+        assert response.status_code == 200
+
+        # Verify filter was applied
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must is not None
+
+    async def test_similar_items_respects_k_parameter(self, mock_qdrant_point):
+        """Should respect the k parameter."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar?k=5")
+
+        assert response.status_code == 200
+
+        # Verify limit was passed to Qdrant
+        call_args = self.qdrant.query_points.call_args
+        assert call_args.kwargs.get("limit") == 5
+
+    async def test_similar_items_k_max_limit(self):
+        """Should reject k values > 50."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar?k=100")
+
+        assert response.status_code == 422
