@@ -215,6 +215,147 @@ class TestRecommendEndpoint:
         call_args = self.qdrant.query_points.call_args
         assert call_args.kwargs.get("query_filter") is not None
 
+    async def test_recommend_with_product_group_filter(self, mock_qdrant_point):
+        """Should apply product_group filter to recommendations."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/recommend/42?product_group=Garment%20Upper%20body"
+            )
+
+        assert response.status_code == 200
+
+        # Verify filter was applied with product_group
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must is not None
+
+    async def test_recommend_with_product_type_filter(self, mock_qdrant_point):
+        """Should apply product_type filter to recommendations."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?product_type=T-shirt")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must is not None
+
+    async def test_recommend_with_exclude_groups(self, mock_qdrant_point):
+        """Should apply exclude_groups filter to recommendations."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/recommend/42?exclude_groups=Accessories,Underwear"
+            )
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+
+    async def test_recommend_with_exclude_types(self, mock_qdrant_point):
+        """Should apply exclude_types filter to recommendations."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?exclude_types=Socks,Belt")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+
+    async def test_recommend_with_combined_filters(self, mock_qdrant_point):
+        """Should combine multiple filters correctly."""
+        user_vector = [0.1] * 32
+        purchased_items = ["100"]
+        self.pipeline.execute.return_value = [json.dumps(user_vector), purchased_items]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/recommend/42?product_group=Garment%20Upper%20body&exclude_types=Socks"
+            )
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        # Should have must (product_group) and must_not (purchased items + exclude_types)
+        assert query_filter.must is not None
+        assert query_filter.must_not is not None
+
+    async def test_recommend_with_exclude_ids(self, mock_qdrant_point):
+        """Should exclude explicitly specified item IDs."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?exclude_ids=100,200,300")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        # Verify the HasIdCondition contains the excluded IDs
+        has_id_condition = query_filter.must_not[0]
+        assert hasattr(has_id_condition, "has_id")
+        assert set(has_id_condition.has_id) == {100, 200, 300}
+
+    async def test_recommend_with_exclude_ids_combined_with_history(
+        self, mock_qdrant_point
+    ):
+        """Should combine explicit exclude_ids with purchase history exclusions."""
+        user_vector = [0.1] * 32
+        purchased_items = ["100", "200"]  # Already purchased
+        self.pipeline.execute.return_value = [json.dumps(user_vector), purchased_items]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?exclude_ids=300,400")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        # Verify both purchase history and explicit exclusions are combined
+        has_id_condition = query_filter.must_not[0]
+        assert hasattr(has_id_condition, "has_id")
+        # Should have 100, 200 (history) + 300, 400 (explicit) = 4 items
+        assert set(has_id_condition.has_id) == {100, 200, 300, 400}
+
 
 # -----------------------------------------------------------------------------
 # Purchase Event Endpoint Tests
@@ -481,3 +622,142 @@ class TestSimilarItemsEndpoint:
             response = await client.get("/items/100/similar?k=100")
 
         assert response.status_code == 422
+
+    async def test_similar_items_excludes_source_item(self, mock_qdrant_point):
+        """Should always exclude the source item from results."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        has_id_condition = query_filter.must_not[0]
+        assert hasattr(has_id_condition, "has_id")
+        assert 100 in has_id_condition.has_id
+
+    async def test_similar_items_with_exclude_ids(self, mock_qdrant_point):
+        """Should exclude explicitly specified item IDs."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar?exclude_ids=200,300")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        has_id_condition = query_filter.must_not[0]
+        assert hasattr(has_id_condition, "has_id")
+        # Should have source item (100) + explicit exclusions (200, 300)
+        assert set(has_id_condition.has_id) == {100, 200, 300}
+
+    async def test_similar_items_with_exclude_groups(self, mock_qdrant_point):
+        """Should exclude specified product groups."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/items/100/similar?exclude_groups=Accessories,Underwear"
+            )
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        # Should have at least 2 conditions: HasIdCondition (source item) and FieldCondition (exclude_groups)
+        assert len(query_filter.must_not) >= 2
+
+    async def test_similar_items_with_exclude_types(self, mock_qdrant_point):
+        """Should exclude specified product types."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar?exclude_types=Socks,Belt")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must_not is not None
+        # Should have at least 2 conditions: HasIdCondition (source item) and FieldCondition (exclude_types)
+        assert len(query_filter.must_not) >= 2
+
+    async def test_similar_items_with_product_type_filter(self, mock_qdrant_point):
+        """Should filter by product_type when specified."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/items/100/similar?product_type=T-shirt")
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        assert query_filter.must is not None
+
+    async def test_similar_items_with_combined_filters(self, mock_qdrant_point):
+        """Should combine multiple filters correctly."""
+        source_point = MagicMock()
+        source_point.id = 100
+        source_point.vector = [0.1] * 32
+        source_point.payload = {}
+        self.qdrant.retrieve.return_value = [source_point]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/items/100/similar?product_group=Garment%20Upper%20body&exclude_ids=200&exclude_types=Socks"
+            )
+
+        assert response.status_code == 200
+
+        call_args = self.qdrant.query_points.call_args
+        query_filter = call_args.kwargs.get("query_filter")
+        assert query_filter is not None
+        # Should have must (product_group) and must_not (source item + exclude_ids + exclude_types)
+        assert query_filter.must is not None
+        assert query_filter.must_not is not None
+        # Must have at least 2 must_not conditions: HasIdCondition and FieldCondition
+        assert len(query_filter.must_not) >= 2
