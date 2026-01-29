@@ -112,6 +112,12 @@ class Metrics:
             buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
         )
 
+        # user profile endpoint metrics
+        self.user_profile_requests = Counter(
+            "user_profile_requests_total",
+            "User profile endpoint requests",
+        )
+
 
 # singleton instance
 metrics = Metrics()

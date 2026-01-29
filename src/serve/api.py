@@ -33,6 +33,8 @@ from src.serve.schemas import (
     RecommendationResponse,
     PurchaseEvent,
     SimilarItemsResponse,
+    CategoryCount,
+    UserProfile,
 )
 
 logger = setup_logging("api.log")
@@ -541,6 +543,135 @@ async def get_similar_items(
         source_item_idx=item_idx,
         source_metadata=source_metadata,
         similar_items=similar_items,
+    )
+
+
+def aggregate_categories(
+    items_metadata: list[dict], field: str, top_k: int
+) -> list[CategoryCount]:
+    from collections import Counter
+
+    counts = Counter(
+        item.get(field, "Unknown") for item in items_metadata if item.get(field)
+    )
+    total = sum(counts.values())
+    if total == 0:
+        return []
+
+    return [
+        CategoryCount(
+            name=name,
+            count=count,
+            percentage=round(count / total * 100, 1),
+        )
+        for name, count in counts.most_common(top_k)
+    ]
+
+
+@app.get("/users/{user_idx}/profile", response_model=UserProfile)
+async def get_user_profile(
+    user_idx: int,
+    recent_limit: int = Query(10, gt=0, le=50, description="Max recent purchases"),
+    top_categories: int = Query(5, gt=0, le=10, description="Max categories per type"),
+    redis_conn: redis.Redis = Depends(get_redis_client),
+    qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
+):
+    redis_start = time.time()
+    async with redis_conn.pipeline() as pipe:
+        pipe.get(f"{REDIS_USER_VECTOR_PREFIX}{user_idx}")
+        pipe.zrange(f"{REDIS_USER_HISTORY_PREFIX}{user_idx}", 0, -1, withscores=True)
+        pipe.get(f"{REDIS_USER_MAP_PREFIX}{user_idx}")
+        results = await pipe.execute()
+    metrics.redis_operation_duration.labels(operation="profile_pipeline").observe(
+        time.time() - redis_start
+    )
+
+    user_vector_json, history_with_scores, customer_id = results
+
+    if user_vector_json is None:
+        metrics.user_profile_requests.inc()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with user_idx={user_idx} not found",
+        )
+
+    metrics.user_profile_requests.inc()
+
+    if not history_with_scores:
+        return UserProfile(
+            user_idx=user_idx,
+            customer_id=customer_id,
+            total_purchases=0,
+            first_purchase_at=None,
+            last_purchase_at=None,
+            recent_purchases=[],
+            top_product_groups=[],
+            top_product_types=[],
+        )
+
+    # Parse history: list of (item_idx_str, timestamp)
+    history_items = [(int(item_id), float(ts)) for item_id, ts in history_with_scores]
+    total_purchases = len(history_items)
+
+    timestamps = [ts for _, ts in history_items]
+    first_purchase_at = min(timestamps)
+    last_purchase_at = max(timestamps)
+
+    # Sort by timestamp descending to get recent items first
+    history_items.sort(key=lambda x: x[1], reverse=True)
+    recent_item_ids = [item_id for item_id, _ in history_items[:recent_limit]]
+    all_item_ids = [item_id for item_id, _ in history_items]
+
+    # Batch retrieve metadata from Qdrant
+    qdrant_start = time.time()
+    try:
+        points = await qdrant_conn.retrieve(
+            collection_name=QDRANT_COLLECTION_NAME,
+            ids=all_item_ids,
+            with_payload=True,
+        )
+        metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_start)
+    except Exception as e:
+        metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_start)
+        logger.error(f"Failed to retrieve items for user profile: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve item metadata: {e}",
+        )
+
+    # Build lookup dict: item_idx -> payload
+    item_metadata_map = {int(p.id): p.payload or {} for p in points}
+
+    # Build recent purchases list (preserve order)
+    recent_purchases = []
+    for item_id in recent_item_ids:
+        metadata = item_metadata_map.get(item_id, {})
+        recent_purchases.append(
+            RecommendationItem(
+                item_idx=item_id,
+                score=0.0,  # no score for history items
+                metadata=metadata,
+            )
+        )
+
+    # Aggregate categories from all history items
+    all_metadata = [item_metadata_map.get(item_id, {}) for item_id in all_item_ids]
+    top_product_groups = aggregate_categories(
+        all_metadata, "product_group_name", top_categories
+    )
+    top_product_types = aggregate_categories(
+        all_metadata, "product_type_name", top_categories
+    )
+
+    return UserProfile(
+        user_idx=user_idx,
+        customer_id=customer_id,
+        total_purchases=total_purchases,
+        first_purchase_at=first_purchase_at,
+        last_purchase_at=last_purchase_at,
+        recent_purchases=recent_purchases,
+        top_product_groups=top_product_groups,
+        top_product_types=top_product_types,
     )
 
 
