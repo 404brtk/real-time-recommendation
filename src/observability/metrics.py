@@ -86,6 +86,19 @@ class Metrics:
             ],  # "user_not_found", "item_not_found", "qdrant_error", "kafka_error"
         )
 
+        # similar items endpoint metrics
+        self.similar_items_requests = Counter(
+            "similar_items_requests_total",
+            "Total similar items requests",
+            ["status"],  # "success", "not_found", "error"
+        )
+
+        self.qdrant_retrieve_duration = Histogram(
+            "qdrant_retrieve_duration_seconds",
+            "Qdrant point retrieve latency",
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+        )
+
 
 # singleton instance
 metrics = Metrics()

@@ -302,6 +302,7 @@ async def get_similar_items(
     ),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
+    qdrant_retrieve_start = time.time()
     try:
         source_points = await qdrant_conn.retrieve(
             collection_name=QDRANT_COLLECTION_NAME,
@@ -309,7 +310,10 @@ async def get_similar_items(
             with_vectors=True,
             with_payload=True,
         )
+        metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_retrieve_start)
     except Exception as e:
+        metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_retrieve_start)
+        metrics.similar_items_requests.labels(status="error").inc()
         logger.error(f"Failed to retrieve item {item_idx} from Qdrant: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -317,6 +321,7 @@ async def get_similar_items(
         )
 
     if not source_points:
+        metrics.similar_items_requests.labels(status="not_found").inc()
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Item with item_idx={item_idx} not found",
@@ -354,6 +359,8 @@ async def get_similar_items(
             query_filter=query_filter,
         )
     except Exception as e:
+        metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
+        metrics.similar_items_requests.labels(status="error").inc()
         logger.error(f"Qdrant search failed for similar items: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -371,6 +378,7 @@ async def get_similar_items(
         for point in search_result.points
     ]
 
+    metrics.similar_items_requests.labels(status="success").inc()
     logger.info(f"Found {len(similar_items)} items similar to item {item_idx}")
 
     return SimilarItemsResponse(
