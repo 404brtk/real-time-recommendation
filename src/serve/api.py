@@ -159,13 +159,110 @@ async def health_check(
     return health_status
 
 
+def build_qdrant_filter(
+    excluded_ids: Optional[list[int]] = None,
+    product_group: Optional[str] = None,
+    product_type: Optional[str] = None,
+    exclude_groups: Optional[list[str]] = None,
+    exclude_types: Optional[list[str]] = None,
+) -> Optional[models.Filter]:
+    """
+    Args:
+        excluded_ids: Item IDs to exclude (e.g., already purchased)
+        product_group: Include only items in this product group
+        product_type: Include only items of this product type
+        exclude_groups: Exclude items in these product groups
+        exclude_types: Exclude items of these product types
+
+    Returns:
+        Qdrant Filter object or None if no filters specified
+    """
+    must_conditions: list[models.Condition] = []
+    must_not_conditions: list[models.Condition] = []
+
+    if excluded_ids:
+        must_not_conditions.append(models.HasIdCondition(has_id=excluded_ids))
+
+    if product_group:
+        must_conditions.append(
+            models.FieldCondition(
+                key="product_group_name",
+                match=models.MatchValue(value=product_group),
+            )
+        )
+
+    if product_type:
+        must_conditions.append(
+            models.FieldCondition(
+                key="product_type_name",
+                match=models.MatchValue(value=product_type),
+            )
+        )
+
+    if exclude_groups:
+        must_not_conditions.append(
+            models.FieldCondition(
+                key="product_group_name",
+                match=models.MatchAny(any=exclude_groups),
+            )
+        )
+
+    if exclude_types:
+        must_not_conditions.append(
+            models.FieldCondition(
+                key="product_type_name",
+                match=models.MatchAny(any=exclude_types),
+            )
+        )
+
+    if not must_conditions and not must_not_conditions:
+        return None
+
+    return models.Filter(
+        must=must_conditions if must_conditions else None,
+        must_not=must_not_conditions if must_not_conditions else None,
+    )
+
+
 @app.get("/recommend/{user_idx}", response_model=RecommendationResponse)
 async def recommend(
     user_idx: int,
     k: int = Query(10, gt=0, le=50, description="Number of recommendations"),
+    product_group: Optional[str] = Query(
+        None, description="Filter by product group (e.g., 'Garment Upper body')"
+    ),
+    product_type: Optional[str] = Query(
+        None, description="Filter by product type (e.g., 'T-shirt')"
+    ),
+    exclude_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated item IDs to exclude (in addition to purchase history)",
+    ),
+    exclude_groups: Optional[str] = Query(
+        None, description="Comma-separated product groups to exclude"
+    ),
+    exclude_types: Optional[str] = Query(
+        None, description="Comma-separated product types to exclude"
+    ),
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
+    parsed_exclude_ids = (
+        [int(i.strip()) for i in exclude_ids.split(",") if i.strip()]
+        if exclude_ids
+        else []
+    )
+    parsed_exclude_groups = (
+        [g.strip() for g in exclude_groups.split(",") if g.strip()]
+        if exclude_groups
+        else None
+    )
+    parsed_exclude_types = (
+        [t.strip() for t in exclude_types.split(",") if t.strip()]
+        if exclude_types
+        else None
+    )
+
     recommendations = []
     item_vectors = []  # for diversity calculation
     source = "personalized"
@@ -189,19 +286,38 @@ async def recommend(
 
         if user_vector_json:
             user_vector = json.loads(user_vector_json)
-            excluded_ids = (
+            # combine purchase history with explicitly excluded IDs
+            history_ids = (
                 [int(i) for i in purchased_items_ids] if purchased_items_ids else []
             )
+            all_excluded_ids = list(set(history_ids + parsed_exclude_ids))
 
-            # track excluded items
-            if excluded_ids:
-                metrics.items_excluded.inc(len(excluded_ids))
+            # track excluded items separately
+            if history_ids:
+                metrics.items_excluded_history.inc(len(history_ids))
+            if parsed_exclude_ids:
+                metrics.items_excluded_explicit.inc(len(parsed_exclude_ids))
 
-            query_filter = None
-            if excluded_ids:
-                query_filter = models.Filter(
-                    must_not=[models.HasIdCondition(has_id=excluded_ids)]
-                )
+            # track filter usage
+            if product_group:
+                metrics.filter_applied.labels(filter_type="product_group").inc()
+            if product_type:
+                metrics.filter_applied.labels(filter_type="product_type").inc()
+            if parsed_exclude_ids:
+                metrics.filter_applied.labels(filter_type="exclude_ids").inc()
+            if parsed_exclude_groups:
+                metrics.filter_applied.labels(filter_type="exclude_groups").inc()
+            if parsed_exclude_types:
+                metrics.filter_applied.labels(filter_type="exclude_types").inc()
+
+            # build combined filter (excluded IDs + attribute filters)
+            query_filter = build_qdrant_filter(
+                excluded_ids=all_excluded_ids if all_excluded_ids else None,
+                product_group=product_group.strip() if product_group else None,
+                product_type=product_type.strip() if product_type else None,
+                exclude_groups=parsed_exclude_groups,
+                exclude_types=parsed_exclude_types,
+            )
 
             # track qdrant search timing
             qdrant_start = time.time()
@@ -298,10 +414,39 @@ async def get_similar_items(
     item_idx: int,
     k: int = Query(10, gt=0, le=50, description="Number of similar items to return"),
     product_group: Optional[str] = Query(
-        None, description="Filter by product group name"
+        None, description="Filter by product group (e.g., 'Garment Upper body')"
+    ),
+    product_type: Optional[str] = Query(
+        None, description="Filter by product type (e.g., 'T-shirt')"
+    ),
+    exclude_ids: Optional[str] = Query(
+        None, description="Comma-separated item IDs to exclude"
+    ),
+    exclude_groups: Optional[str] = Query(
+        None, description="Comma-separated product groups to exclude"
+    ),
+    exclude_types: Optional[str] = Query(
+        None, description="Comma-separated product types to exclude"
     ),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
+    # Parse comma-separated filter values
+    parsed_exclude_ids = (
+        [int(i.strip()) for i in exclude_ids.split(",") if i.strip()]
+        if exclude_ids
+        else []
+    )
+    parsed_exclude_groups = (
+        [g.strip() for g in exclude_groups.split(",") if g.strip()]
+        if exclude_groups
+        else None
+    )
+    parsed_exclude_types = (
+        [t.strip() for t in exclude_types.split(",") if t.strip()]
+        if exclude_types
+        else None
+    )
+
     qdrant_retrieve_start = time.time()
     try:
         source_points = await qdrant_conn.retrieve(
@@ -328,24 +473,35 @@ async def get_similar_items(
         )
 
     source_point = source_points[0]
-    source_vector: list[float] = [float(x) for x in source_point.vector]
+    source_vector: list[float] = [float(x) for x in source_point.vector]  # type: ignore[union-attr]
     source_metadata = source_point.payload or {}
 
-    # build filter: exclude source item, optionally filter by product group
-    must_not_conditions = [models.HasIdCondition(has_id=[item_idx])]
+    # Combine source item with explicitly excluded IDs
+    all_excluded_ids = list(set([item_idx] + parsed_exclude_ids))
 
-    must_conditions = []
+    # track explicit exclusions (not counting the source item which is always excluded)
+    if parsed_exclude_ids:
+        metrics.items_excluded_explicit.inc(len(parsed_exclude_ids))
+
+    # track filter usage
     if product_group:
-        must_conditions.append(
-            models.FieldCondition(
-                key="product_group_name",
-                match=models.MatchValue(value=product_group),
-            )
-        )
+        metrics.filter_applied.labels(filter_type="product_group").inc()
+    if product_type:
+        metrics.filter_applied.labels(filter_type="product_type").inc()
+    if parsed_exclude_ids:
+        metrics.filter_applied.labels(filter_type="exclude_ids").inc()
+    if parsed_exclude_groups:
+        metrics.filter_applied.labels(filter_type="exclude_groups").inc()
+    if parsed_exclude_types:
+        metrics.filter_applied.labels(filter_type="exclude_types").inc()
 
-    query_filter = models.Filter(
-        must=must_conditions if must_conditions else None,
-        must_not=must_not_conditions,
+    # Build filter: exclude source item + user-specified exclusions + attribute filters
+    query_filter = build_qdrant_filter(
+        excluded_ids=all_excluded_ids,
+        product_group=product_group.strip() if product_group else None,
+        product_type=product_type.strip() if product_type else None,
+        exclude_groups=parsed_exclude_groups,
+        exclude_types=parsed_exclude_types,
     )
 
     # search for similar items

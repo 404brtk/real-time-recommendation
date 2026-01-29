@@ -16,9 +16,22 @@ class Metrics:
             ["reason"],
         )
 
-        self.items_excluded = Counter(
-            "items_excluded_total",
-            "Items excluded from recommendations (already purchased)",
+        self.items_excluded_history = Counter(
+            "items_excluded_history_total",
+            "Items excluded from recommendations due to purchase history",
+        )
+
+        self.items_excluded_explicit = Counter(
+            "items_excluded_explicit_total",
+            "Items explicitly excluded via exclude_ids parameter",
+        )
+
+        self.filter_applied = Counter(
+            "filter_applied_total",
+            "Filters applied to recommendations",
+            [
+                "filter_type"
+            ],  # "product_group", "product_type", "exclude_ids", "exclude_groups", "exclude_types"
         )
 
         self.redis_operation_duration = Histogram(
