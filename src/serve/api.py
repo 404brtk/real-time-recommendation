@@ -35,6 +35,7 @@ from src.serve.schemas import (
     SimilarItemsResponse,
     CategoryCount,
     UserProfile,
+    ContributionItem,
 )
 
 logger = setup_logging("api.log")
@@ -69,6 +70,17 @@ def compute_diversity(vectors: list[Any]) -> float:
             count += 1
 
     return total_distance / count if count > 0 else 0.0
+
+
+def compute_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    a = np.array(vec_a, dtype=np.float32)
+    b = np.array(vec_b, dtype=np.float32)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
 
 
 @asynccontextmanager  # thanks to this the app knows when to execute code before and after yield
@@ -246,6 +258,12 @@ async def recommend(
     exclude_types: Optional[str] = Query(
         None, description="Comma-separated product types to exclude"
     ),
+    explain: bool = Query(
+        False, description="Include explanation for each recommendation"
+    ),
+    explain_top_k: int = Query(
+        3, gt=0, le=10, description="Number of contributing items per recommendation"
+    ),
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
@@ -269,6 +287,7 @@ async def recommend(
     item_vectors = []  # for diversity calculation
     source = "personalized"
     user_type = "known"
+    history_ids: list[int] = []  # track for explain feature
 
     try:
         redis_vector_key = f"{REDIS_USER_VECTOR_PREFIX}{user_idx}"
@@ -403,6 +422,69 @@ async def recommend(
     if item_vectors and len(item_vectors) >= 2:
         diversity = compute_diversity(item_vectors)
         metrics.recommendation_diversity.observe(diversity)
+
+    # compute explanations if requested (only for personalized with history)
+    # TODO: this explanation only reflects real-time purchase history (redis), not the
+    # batch-trained ALS embeddings (Delta Lake). The user vector is shaped by both sources,
+    # so these contributions are approximate - they show which recent purchases are similar
+    # to recommendations, not the full picture of why the model made each recommendation
+    # We could just load the full history from delta lake but that would make it pretty slow I guess
+    # Anyway it's a nice-to-have feature even with this limitation
+    if explain and source == "personalized" and history_ids and item_vectors:
+        metrics.explain_requests.inc()
+        explain_start = time.time()
+
+        # fetch last 20 history item vectors (limit for performance)
+        history_to_fetch = history_ids[:20]
+        try:
+            history_points = await qdrant_conn.retrieve(
+                collection_name=QDRANT_COLLECTION_NAME,
+                ids=history_to_fetch,
+                with_vectors=True,
+                with_payload=True,
+            )
+
+            # build history lookup: {item_idx: (vector, name)}
+            history_data = {
+                int(p.id): (
+                    list(p.vector),
+                    p.payload.get("prod_name", "Unknown") if p.payload else "Unknown",
+                )
+                for p in history_points
+                if p.vector
+            }
+
+            # for each recommendation, compute similarities to history items
+            for i, rec in enumerate(recommendations):
+                if i >= len(item_vectors):
+                    break
+                rec_vector = item_vectors[i]
+                similarities = []
+
+                for hist_idx, (hist_vec, hist_name) in history_data.items():
+                    sim = compute_cosine_similarity(rec_vector, hist_vec)
+                    similarities.append((hist_idx, hist_name, sim))
+
+                # sort by similarity, take top k
+                similarities.sort(key=lambda x: x[2], reverse=True)
+                top_contributors = similarities[:explain_top_k]
+
+                # normalize to percentages
+                total_sim = sum(s[2] for s in top_contributors) or 1.0
+                rec.explanation = [
+                    ContributionItem(
+                        item_idx=idx,
+                        item_name=name,
+                        similarity=round(sim, 4),
+                        contribution_pct=round(sim / total_sim * 100, 1),
+                    )
+                    for idx, name, sim in top_contributors
+                ]
+
+            metrics.explain_computation_duration.observe(time.time() - explain_start)
+        except Exception as e:
+            logger.error(f"Failed to compute explanations: {e}")
+            # don't fail the request, just skip explanations
 
     return RecommendationResponse(
         user_idx=user_idx,

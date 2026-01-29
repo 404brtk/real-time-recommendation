@@ -2,10 +2,18 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 
 
+class ContributionItem(BaseModel):
+    item_idx: int
+    item_name: str
+    similarity: float
+    contribution_pct: float
+
+
 class RecommendationItem(BaseModel):
     item_idx: int  # internal item index (maps to article_id via item_map)
     score: float
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    explanation: Optional[List[ContributionItem]] = None
 
 
 class RecommendationResponse(BaseModel):

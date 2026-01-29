@@ -118,6 +118,18 @@ class Metrics:
             "User profile endpoint requests",
         )
 
+        # explain feature metrics
+        self.explain_requests = Counter(
+            "explain_requests_total",
+            "Recommendation requests with explain=true",
+        )
+
+        self.explain_computation_duration = Histogram(
+            "explain_computation_duration_seconds",
+            "Time to compute recommendation explanations",
+            buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+        )
+
 
 # singleton instance
 metrics = Metrics()
