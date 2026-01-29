@@ -761,3 +761,233 @@ class TestSimilarItemsEndpoint:
         assert query_filter.must_not is not None
         # Must have at least 2 must_not conditions: HasIdCondition and FieldCondition
         assert len(query_filter.must_not) >= 2
+
+
+# -----------------------------------------------------------------------------
+# User Profile Endpoint Tests
+# -----------------------------------------------------------------------------
+
+
+class TestUserProfileEndpoint:
+    """Tests for the /users/{user_idx}/profile endpoint."""
+
+    @pytest.fixture(autouse=True)
+    async def setup_app(self, mock_async_redis, mock_async_qdrant, mock_redis_pipeline):
+        """Set up app state with mocked clients."""
+        mock_async_redis.pipeline.return_value = mock_redis_pipeline
+        app.state.redis_client = mock_async_redis
+        app.state.qdrant_client = mock_async_qdrant
+        self.redis = mock_async_redis
+        self.qdrant = mock_async_qdrant
+        self.pipeline = mock_redis_pipeline
+        yield
+
+    async def test_user_profile_active_user(self):
+        """Should return full profile for user with vector and history."""
+        user_vector = [0.1] * 32
+        # History: (item_idx, timestamp) pairs
+        history_with_scores = [("100", 1700000000.0), ("200", 1700001000.0)]
+        customer_id = "customer_abc123"
+        self.pipeline.execute.return_value = [
+            json.dumps(user_vector),
+            history_with_scores,
+            customer_id,
+        ]
+
+        # Mock Qdrant retrieve for item metadata
+        point1 = MagicMock()
+        point1.id = 100
+        point1.payload = {
+            "article_id": "1111111111",
+            "prod_name": "T-shirt",
+            "product_type_name": "T-shirt",
+            "product_group_name": "Garment Upper body",
+        }
+        point2 = MagicMock()
+        point2.id = 200
+        point2.payload = {
+            "article_id": "2222222222",
+            "prod_name": "Jeans",
+            "product_type_name": "Trousers",
+            "product_group_name": "Garment Lower body",
+        }
+        self.qdrant.retrieve.return_value = [point1, point2]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/42/profile")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["user_idx"] == 42
+        assert data["customer_id"] == "customer_abc123"
+        assert data["total_purchases"] == 2
+        assert data["first_purchase_at"] == 1700000000.0
+        assert data["last_purchase_at"] == 1700001000.0
+        assert len(data["recent_purchases"]) == 2
+        assert len(data["top_product_groups"]) == 2
+        assert len(data["top_product_types"]) == 2
+
+    async def test_user_profile_no_vector_returns_404(self):
+        """Should return 404 for user without vector (even if history exists)."""
+        # No vector, but has history - still returns 404
+        history_with_scores = [("100", 1700000000.0)]
+        customer_id = "customer_xyz789"
+        self.pipeline.execute.return_value = [None, history_with_scores, customer_id]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/42/profile")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    async def test_user_profile_not_found(self):
+        """Should return 404 for unknown user."""
+        # No vector, no history, no customer_id
+        self.pipeline.execute.return_value = [None, [], None]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/99999/profile")
+
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"].lower()
+
+    async def test_user_profile_respects_recent_limit(self):
+        """Should respect recent_limit parameter."""
+        user_vector = [0.1] * 32
+        # History with 5 items
+        history_with_scores = [
+            ("100", 1700000000.0),
+            ("200", 1700001000.0),
+            ("300", 1700002000.0),
+            ("400", 1700003000.0),
+            ("500", 1700004000.0),
+        ]
+        self.pipeline.execute.return_value = [
+            json.dumps(user_vector),
+            history_with_scores,
+            "customer_123",
+        ]
+
+        points = []
+        for i in range(5):
+            p = MagicMock()
+            p.id = (i + 1) * 100
+            p.payload = {"prod_name": f"Product {i + 1}"}
+            points.append(p)
+        self.qdrant.retrieve.return_value = points
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/42/profile?recent_limit=2")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_purchases"] == 5  # all items in history
+        assert len(data["recent_purchases"]) == 2  # only 2 returned
+
+    async def test_user_profile_respects_top_categories(self):
+        """Should respect top_categories parameter."""
+        user_vector = [0.1] * 32
+        history_with_scores = [
+            ("100", 1700000000.0),
+            ("200", 1700001000.0),
+            ("300", 1700002000.0),
+        ]
+        self.pipeline.execute.return_value = [
+            json.dumps(user_vector),
+            history_with_scores,
+            "customer_123",
+        ]
+
+        points = []
+        groups = ["Accessories", "Garment Upper body", "Garment Lower body"]
+        for i, group in enumerate(groups):
+            p = MagicMock()
+            p.id = (i + 1) * 100
+            p.payload = {"product_group_name": group, "product_type_name": f"Type{i}"}
+            points.append(p)
+        self.qdrant.retrieve.return_value = points
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/42/profile?top_categories=2")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["top_product_groups"]) == 2
+        assert len(data["top_product_types"]) == 2
+
+    async def test_user_profile_category_aggregation(self):
+        """Should correctly aggregate and calculate category percentages."""
+        user_vector = [0.1] * 32
+        history_with_scores = [
+            ("100", 1700000000.0),
+            ("200", 1700001000.0),
+            ("300", 1700002000.0),
+            ("400", 1700003000.0),
+        ]
+        self.pipeline.execute.return_value = [
+            json.dumps(user_vector),
+            history_with_scores,
+            "customer_123",
+        ]
+
+        # 3 items from "Garment Upper body", 1 from "Accessories"
+        points = []
+        for i in range(3):
+            p = MagicMock()
+            p.id = (i + 1) * 100
+            p.payload = {
+                "product_group_name": "Garment Upper body",
+                "product_type_name": "T-shirt",
+            }
+            points.append(p)
+        p4 = MagicMock()
+        p4.id = 400
+        p4.payload = {
+            "product_group_name": "Accessories",
+            "product_type_name": "Hat",
+        }
+        points.append(p4)
+        self.qdrant.retrieve.return_value = points
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/42/profile")
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check aggregation
+        groups = {g["name"]: g for g in data["top_product_groups"]}
+        assert "Garment Upper body" in groups
+        assert groups["Garment Upper body"]["count"] == 3
+        assert groups["Garment Upper body"]["percentage"] == 75.0
+        assert "Accessories" in groups
+        assert groups["Accessories"]["count"] == 1
+        assert groups["Accessories"]["percentage"] == 25.0
+
+    async def test_user_profile_no_history(self):
+        """Should return profile with empty history for user with vector but no purchases."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [
+            json.dumps(user_vector),
+            [],
+            "customer_123",
+        ]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/users/42/profile")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_purchases"] == 0
+        assert data["recent_purchases"] == []
+        assert data["top_product_groups"] == []
+        assert data["top_product_types"] == []
+        assert data["first_purchase_at"] is None
+        assert data["last_purchase_at"] is None
