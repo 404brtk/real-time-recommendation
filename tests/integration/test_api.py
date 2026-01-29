@@ -356,6 +356,108 @@ class TestRecommendEndpoint:
         # Should have 100, 200 (history) + 300, 400 (explicit) = 4 items
         assert set(has_id_condition.has_id) == {100, 200, 300, 400}
 
+    async def test_recommend_explain_false_by_default(self, mock_qdrant_point):
+        """Should not include explanations by default."""
+        user_vector = [0.1] * 32
+        purchased_items = ["100"]
+        self.pipeline.execute.return_value = [json.dumps(user_vector), purchased_items]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["recommendations"][0].get("explanation") is None
+
+    async def test_recommend_with_explain_returns_explanations(self, mock_qdrant_point):
+        """Should return explanations when explain=true."""
+        user_vector = [0.1] * 32
+        purchased_items = ["100", "200"]
+        self.pipeline.execute.return_value = [json.dumps(user_vector), purchased_items]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        # Mock history item retrieval for explain
+        history_point1 = MagicMock()
+        history_point1.id = 100
+        history_point1.vector = [0.2] * 32
+        history_point1.payload = {"prod_name": "History Item 1"}
+        history_point2 = MagicMock()
+        history_point2.id = 200
+        history_point2.vector = [0.15] * 32
+        history_point2.payload = {"prod_name": "History Item 2"}
+        self.qdrant.retrieve.return_value = [history_point1, history_point2]
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?explain=true")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "personalized"
+        rec = data["recommendations"][0]
+        assert rec["explanation"] is not None
+        assert len(rec["explanation"]) > 0
+        # Check explanation structure
+        exp = rec["explanation"][0]
+        assert "item_idx" in exp
+        assert "item_name" in exp
+        assert "similarity" in exp
+        assert "contribution_pct" in exp
+
+    async def test_recommend_explain_respects_top_k(self, mock_qdrant_point):
+        """Should respect explain_top_k parameter."""
+        user_vector = [0.1] * 32
+        purchased_items = ["100", "200", "300"]
+        self.pipeline.execute.return_value = [json.dumps(user_vector), purchased_items]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        # Mock 3 history items
+        history_points = []
+        for i, item_id in enumerate([100, 200, 300]):
+            hp = MagicMock()
+            hp.id = item_id
+            hp.vector = [0.1 + i * 0.05] * 32
+            hp.payload = {"prod_name": f"History Item {i + 1}"}
+            history_points.append(hp)
+        self.qdrant.retrieve.return_value = history_points
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?explain=true&explain_top_k=2")
+
+        assert response.status_code == 200
+        data = response.json()
+        rec = data["recommendations"][0]
+        assert rec["explanation"] is not None
+        assert len(rec["explanation"]) <= 2
+
+    async def test_recommend_explain_only_for_personalized(self, sample_popular_items):
+        """Should not include explanations for trending recommendations."""
+        # User has no vector - will fall back to trending
+        self.pipeline.execute.return_value = [None, []]
+        self.redis.get.return_value = json.dumps(sample_popular_items)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/9999?explain=true")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "trending_now"
+        # Trending items should not have explanations
+        for rec in data["recommendations"]:
+            assert rec.get("explanation") is None
+
+    async def test_recommend_explain_top_k_validation(self):
+        """Should reject explain_top_k values > 10."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/1?explain=true&explain_top_k=15")
+
+        assert response.status_code == 422
+
 
 # -----------------------------------------------------------------------------
 # Purchase Event Endpoint Tests
