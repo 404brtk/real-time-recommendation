@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 from fastapi import FastAPI, Depends, Response, Query, HTTPException, status
 import redis.asyncio as redis
 from qdrant_client import AsyncQdrantClient
@@ -28,7 +28,12 @@ from src.config import (
     KAFKA_TOPIC_EVENTS,
 )
 
-from src.serve.schemas import RecommendationItem, RecommendationResponse, PurchaseEvent
+from src.serve.schemas import (
+    RecommendationItem,
+    RecommendationResponse,
+    PurchaseEvent,
+    SimilarItemsResponse,
+)
 
 logger = setup_logging("api.log")
 
@@ -285,6 +290,93 @@ async def recommend(
         user_idx=user_idx,
         source=source,
         recommendations=recommendations,
+    )
+
+
+@app.get("/items/{item_idx}/similar", response_model=SimilarItemsResponse)
+async def get_similar_items(
+    item_idx: int,
+    k: int = Query(10, gt=0, le=50, description="Number of similar items to return"),
+    product_group: Optional[str] = Query(
+        None, description="Filter by product group name"
+    ),
+    qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
+):
+    try:
+        source_points = await qdrant_conn.retrieve(
+            collection_name=QDRANT_COLLECTION_NAME,
+            ids=[item_idx],
+            with_vectors=True,
+            with_payload=True,
+        )
+    except Exception as e:
+        logger.error(f"Failed to retrieve item {item_idx} from Qdrant: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve item: {e}",
+        )
+
+    if not source_points:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Item with item_idx={item_idx} not found",
+        )
+
+    source_point = source_points[0]
+    source_vector: list[float] = [float(x) for x in source_point.vector]
+    source_metadata = source_point.payload or {}
+
+    # build filter: exclude source item, optionally filter by product group
+    must_not_conditions = [models.HasIdCondition(has_id=[item_idx])]
+
+    must_conditions = []
+    if product_group:
+        must_conditions.append(
+            models.FieldCondition(
+                key="product_group_name",
+                match=models.MatchValue(value=product_group),
+            )
+        )
+
+    query_filter = models.Filter(
+        must=must_conditions if must_conditions else None,
+        must_not=must_not_conditions,
+    )
+
+    # search for similar items
+    qdrant_start = time.time()
+    try:
+        search_result = await qdrant_conn.query_points(
+            collection_name=QDRANT_COLLECTION_NAME,
+            query=source_vector,
+            limit=k,
+            with_payload=True,
+            query_filter=query_filter,
+        )
+    except Exception as e:
+        logger.error(f"Qdrant search failed for similar items: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Search failed: {e}",
+        )
+
+    metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
+
+    similar_items = [
+        RecommendationItem(
+            item_idx=int(point.id),
+            score=point.score,
+            metadata=point.payload or {},
+        )
+        for point in search_result.points
+    ]
+
+    logger.info(f"Found {len(similar_items)} items similar to item {item_idx}")
+
+    return SimilarItemsResponse(
+        source_item_idx=item_idx,
+        source_metadata=source_metadata,
+        similar_items=similar_items,
     )
 
 

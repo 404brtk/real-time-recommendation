@@ -17,3 +17,9 @@ class RecommendationResponse(BaseModel):
 class PurchaseEvent(BaseModel):
     user_idx: int  # internal user index
     item_idx: int  # internal item index
+
+
+class SimilarItemsResponse(BaseModel):
+    source_item_idx: int
+    source_metadata: Dict[str, Any] = Field(default_factory=dict)
+    similar_items: List[RecommendationItem]
