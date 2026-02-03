@@ -130,6 +130,18 @@ class Metrics:
             buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
         )
 
+        # MMR reranking metrics
+        self.mmr_rerank_applied = Counter(
+            "mmr_rerank_applied_total",
+            "Times MMR reranking was applied to recommendations",
+        )
+
+        self.mmr_rerank_duration = Histogram(
+            "mmr_rerank_duration_seconds",
+            "Time to compute MMR reranking",
+            buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25),
+        )
+
 
 # singleton instance
 metrics = Metrics()
