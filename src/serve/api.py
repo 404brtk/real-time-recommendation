@@ -10,7 +10,7 @@ import numpy as np
 from kafka import KafkaProducer
 
 from src.logging import setup_logging
-from src.observability import setup_metrics, setup_tracing, metrics
+from src.observability import setup_metrics, setup_tracing, metrics, qdrant_span
 
 from src.serve.dependencies import get_redis_client, get_qdrant_client
 
@@ -419,14 +419,21 @@ async def recommend(
 
             # track qdrant search timing
             qdrant_start = time.time()
-            search_result = await qdrant_conn.query_points(
-                collection_name=QDRANT_COLLECTION_NAME,
-                query=user_vector,
+            with qdrant_span(
+                "query_points",
+                QDRANT_COLLECTION_NAME,
                 limit=fetch_limit,
-                with_payload=True,
-                with_vectors=True,  # need vectors for diversity calculation and MMR
-                query_filter=query_filter,
-            )
+                with_vectors=True,
+            ) as span:
+                search_result = await qdrant_conn.query_points(
+                    collection_name=QDRANT_COLLECTION_NAME,
+                    query=user_vector,
+                    limit=fetch_limit,
+                    with_payload=True,
+                    with_vectors=True,  # need vectors for diversity calculation and MMR
+                    query_filter=query_filter,
+                )
+                span.set_attribute("db.qdrant.results_count", len(search_result.points))
             metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
 
             # extract points data
@@ -545,12 +552,20 @@ async def recommend(
         # fetch last 20 history item vectors (limit for performance)
         history_to_fetch = history_ids[:20]
         try:
-            history_points = await qdrant_conn.retrieve(
-                collection_name=QDRANT_COLLECTION_NAME,
-                ids=history_to_fetch,
+            with qdrant_span(
+                "retrieve",
+                QDRANT_COLLECTION_NAME,
+                ids_count=len(history_to_fetch),
                 with_vectors=True,
-                with_payload=True,
-            )
+                purpose="explain_history",
+            ) as span:
+                history_points = await qdrant_conn.retrieve(
+                    collection_name=QDRANT_COLLECTION_NAME,
+                    ids=history_to_fetch,
+                    with_vectors=True,
+                    with_payload=True,
+                )
+                span.set_attribute("db.qdrant.results_count", len(history_points))
 
             # build history lookup: {item_idx: (vector, name)}
             history_data = {
@@ -641,12 +656,20 @@ async def get_similar_items(
 
     qdrant_retrieve_start = time.time()
     try:
-        source_points = await qdrant_conn.retrieve(
-            collection_name=QDRANT_COLLECTION_NAME,
-            ids=[item_idx],
+        with qdrant_span(
+            "retrieve",
+            QDRANT_COLLECTION_NAME,
+            ids_count=1,
             with_vectors=True,
-            with_payload=True,
-        )
+            purpose="similar_items_source",
+        ) as span:
+            source_points = await qdrant_conn.retrieve(
+                collection_name=QDRANT_COLLECTION_NAME,
+                ids=[item_idx],
+                with_vectors=True,
+                with_payload=True,
+            )
+            span.set_attribute("db.qdrant.results_count", len(source_points))
         metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_retrieve_start)
     except Exception as e:
         metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_retrieve_start)
@@ -699,13 +722,20 @@ async def get_similar_items(
     # search for similar items
     qdrant_start = time.time()
     try:
-        search_result = await qdrant_conn.query_points(
-            collection_name=QDRANT_COLLECTION_NAME,
-            query=source_vector,
+        with qdrant_span(
+            "query_points",
+            QDRANT_COLLECTION_NAME,
             limit=k,
-            with_payload=True,
-            query_filter=query_filter,
-        )
+            purpose="similar_items_search",
+        ) as span:
+            search_result = await qdrant_conn.query_points(
+                collection_name=QDRANT_COLLECTION_NAME,
+                query=source_vector,
+                limit=k,
+                with_payload=True,
+                query_filter=query_filter,
+            )
+            span.set_attribute("db.qdrant.results_count", len(search_result.points))
     except Exception as e:
         metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
         metrics.similar_items_requests.labels(status="error").inc()
@@ -815,11 +845,18 @@ async def get_user_profile(
     # Batch retrieve metadata from Qdrant
     qdrant_start = time.time()
     try:
-        points = await qdrant_conn.retrieve(
-            collection_name=QDRANT_COLLECTION_NAME,
-            ids=all_item_ids,
-            with_payload=True,
-        )
+        with qdrant_span(
+            "retrieve",
+            QDRANT_COLLECTION_NAME,
+            ids_count=len(all_item_ids),
+            purpose="user_profile_history",
+        ) as span:
+            points = await qdrant_conn.retrieve(
+                collection_name=QDRANT_COLLECTION_NAME,
+                ids=all_item_ids,
+                with_payload=True,
+            )
+            span.set_attribute("db.qdrant.results_count", len(points))
         metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_start)
     except Exception as e:
         metrics.qdrant_retrieve_duration.observe(time.time() - qdrant_start)
@@ -902,11 +939,18 @@ async def record_purchase(
 
     # get article_id from Qdrant payload
     try:
-        points = await qdrant_conn.retrieve(
-            collection_name=QDRANT_COLLECTION_NAME,
-            ids=[event.item_idx],
-            with_payload=True,
-        )
+        with qdrant_span(
+            "retrieve",
+            QDRANT_COLLECTION_NAME,
+            ids_count=1,
+            purpose="purchase_item_lookup",
+        ) as span:
+            points = await qdrant_conn.retrieve(
+                collection_name=QDRANT_COLLECTION_NAME,
+                ids=[event.item_idx],
+                with_payload=True,
+            )
+            span.set_attribute("db.qdrant.results_count", len(points))
         if not points:
             metrics.purchase_lookup_errors.labels(error_type="item_not_found").inc()
             raise HTTPException(
