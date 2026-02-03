@@ -458,6 +458,91 @@ class TestRecommendEndpoint:
 
         assert response.status_code == 422
 
+    async def test_recommend_default_diversity_lambda(self, mock_qdrant_point):
+        """Should use diversity_lambda=0.8 by default (slight diversity)."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42")
+
+        assert response.status_code == 200
+        # With default lambda=0.8 (< 1.0), MMR should be applied
+        # Verify overfetching: limit should be > k (default k=10)
+        call_args = self.qdrant.query_points.call_args
+        assert call_args.kwargs.get("limit") > 10
+
+    async def test_recommend_diversity_lambda_one_skips_mmr(self, mock_qdrant_point):
+        """Should skip MMR when diversity_lambda=1.0 (pure relevance)."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+        self.qdrant.query_points.return_value = MagicMock(points=[mock_qdrant_point])
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?k=5&diversity_lambda=1.0")
+
+        assert response.status_code == 200
+        # With lambda=1.0, no overfetching - limit should equal k
+        call_args = self.qdrant.query_points.call_args
+        assert call_args.kwargs.get("limit") == 5
+
+    async def test_recommend_diversity_lambda_validation(self):
+        """Should reject diversity_lambda values outside 0.0-1.0."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/1?diversity_lambda=1.5")
+
+        assert response.status_code == 422
+
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/1?diversity_lambda=-0.1")
+
+        assert response.status_code == 422
+
+    async def test_recommend_mmr_applied_for_personalized(self):
+        """Should apply MMR reranking for personalized recommendations."""
+        user_vector = [0.1] * 32
+        self.pipeline.execute.return_value = [json.dumps(user_vector), []]
+
+        # Create multiple mock points with different vectors for MMR to work with
+        mock_points = []
+        for i in range(10):
+            point = MagicMock()
+            point.id = 100 + i
+            point.score = 0.9 - (i * 0.05)
+            point.payload = {"prod_name": f"Product {i}"}
+            point.vector = [0.1 + (i * 0.02)] * 32
+            mock_points.append(point)
+
+        self.qdrant.query_points.return_value = MagicMock(points=mock_points)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/42?k=5&diversity_lambda=0.5")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "personalized"
+        assert len(data["recommendations"]) == 5
+
+    async def test_recommend_mmr_skipped_for_trending(self, sample_popular_items):
+        """Should not apply MMR for trending fallback recommendations."""
+        # User has no vector - will fall back to trending
+        self.pipeline.execute.return_value = [None, []]
+        self.redis.get.return_value = json.dumps(sample_popular_items)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/recommend/9999?diversity_lambda=0.5")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "trending_now"
+        # MMR is not applied for trending, but request should succeed
+
 
 # -----------------------------------------------------------------------------
 # Purchase Event Endpoint Tests
