@@ -83,6 +83,74 @@ def compute_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     return float(np.dot(a, b) / (norm_a * norm_b))
 
 
+def mmr_rerank(
+    scores: list[float],
+    vectors: list[list[float]],
+    lambda_param: float,
+    k: int,
+) -> list[int]:
+    """
+    Rerank items using Maximal Marginal Relevance (MMR).
+
+    MMR balances relevance with diversity by penalizing items similar to
+    already-selected items.
+
+    Formula: MMR(i) = lambda * relevance(i) - (1-lambda) * max_sim(i, selected)
+
+    Args:
+        scores: Relevance scores for each item (from Qdrant search)
+        vectors: Item vectors for similarity computation
+        lambda_param: Trade-off parameter (1.0 = pure relevance, 0.0 = pure diversity)
+        k: Number of items to select
+
+    Returns:
+        List of indices into the original lists, representing the reranked order
+    """
+    if len(scores) == 0:
+        return []
+
+    n = len(scores)
+    k = min(k, n)
+
+    # normalize scores to [0, 1] for fair comparison with similarities
+    scores_np = np.array(scores, dtype=np.float32)
+    score_min, score_max = scores_np.min(), scores_np.max()
+    score_range = score_max - score_min
+    if score_range > 0:
+        normalized_scores = (scores_np - score_min) / score_range
+    else:
+        normalized_scores = np.ones(n, dtype=np.float32)
+
+    # precompute normalized vectors and full similarity matrix
+    vectors_np = np.array(vectors, dtype=np.float32)
+    norms = np.linalg.norm(vectors_np, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    normalized_vectors = vectors_np / norms
+    sim_matrix = normalized_vectors @ normalized_vectors.T
+
+    # track max similarity to selected set for each candidate (updated incrementally)
+    max_sims = np.zeros(n, dtype=np.float32)
+
+    selected: list[int] = []
+    remaining_mask = np.ones(n, dtype=bool)
+
+    for _ in range(k):
+        # compute MMR scores for all candidates (vectorized)
+        mmr_scores = lambda_param * normalized_scores - (1 - lambda_param) * max_sims
+        mmr_scores[~remaining_mask] = -np.inf  # exclude already selected
+
+        # select best candidate
+        best_idx = int(np.argmax(mmr_scores))
+        selected.append(best_idx)
+        remaining_mask[best_idx] = False
+
+        # update max similarities incrementally (only against newly selected item)
+        new_sims = sim_matrix[:, best_idx]
+        max_sims = np.maximum(max_sims, new_sims)
+
+    return selected
+
+
 @asynccontextmanager  # thanks to this the app knows when to execute code before and after yield
 async def lifespan(app: FastAPI):
     # during startup - before handling requests
@@ -264,6 +332,12 @@ async def recommend(
     explain_top_k: int = Query(
         3, gt=0, le=10, description="Number of contributing items per recommendation"
     ),
+    diversity_lambda: float = Query(
+        0.8,
+        ge=0.0,
+        le=1.0,
+        description="MMR diversity parameter (1.0 = pure relevance, 0.0 = pure diversity)",
+    ),
     redis_conn: redis.Redis = Depends(get_redis_client),
     qdrant_conn: AsyncQdrantClient = Depends(get_qdrant_client),
 ):
@@ -340,31 +414,65 @@ async def recommend(
                 exclude_types=parsed_exclude_types,
             )
 
+            # overfetch candidates for MMR reranking (if diversity enabled)
+            fetch_limit = k if diversity_lambda >= 1.0 else min(k * 2, k + 20, 50)
+
             # track qdrant search timing
             qdrant_start = time.time()
             search_result = await qdrant_conn.query_points(
                 collection_name=QDRANT_COLLECTION_NAME,
                 query=user_vector,
-                limit=k,
+                limit=fetch_limit,
                 with_payload=True,
-                with_vectors=True,  # need vectors for diversity calculation
+                with_vectors=True,  # need vectors for diversity calculation and MMR
                 query_filter=query_filter,
             )
             metrics.qdrant_search_duration.observe(time.time() - qdrant_start)
 
-            recommendations = [
-                RecommendationItem(
-                    item_idx=int(point.id),
-                    score=point.score,
-                    metadata=point.payload or {},
-                )
-                for point in search_result.points
-            ]
+            # extract points data
+            points = search_result.points
+            all_scores = [point.score for point in points]
+            all_vectors = [list(point.vector) for point in points if point.vector]
+            all_payloads = [point.payload or {} for point in points]
+            all_ids = [int(point.id) for point in points]
 
-            # collect vectors for diversity calculation
-            item_vectors = [
-                list(point.vector) for point in search_result.points if point.vector
-            ]
+            # apply MMR reranking if diversity is enabled and we have vectors
+            if (
+                diversity_lambda < 1.0
+                and len(all_vectors) == len(points)
+                and len(points) > 0
+            ):
+                mmr_start = time.time()
+                reranked_indices = mmr_rerank(
+                    scores=all_scores,
+                    vectors=all_vectors,
+                    lambda_param=diversity_lambda,
+                    k=k,
+                )
+                metrics.mmr_rerank_duration.observe(time.time() - mmr_start)
+                metrics.mmr_rerank_applied.inc()
+
+                # reorder based on MMR results
+                recommendations = [
+                    RecommendationItem(
+                        item_idx=all_ids[idx],
+                        score=all_scores[idx],
+                        metadata=all_payloads[idx],
+                    )
+                    for idx in reranked_indices
+                ]
+                item_vectors = [all_vectors[idx] for idx in reranked_indices]
+            else:
+                # no MMR, just take top k
+                recommendations = [
+                    RecommendationItem(
+                        item_idx=all_ids[i],
+                        score=all_scores[i],
+                        metadata=all_payloads[i],
+                    )
+                    for i in range(min(k, len(points)))
+                ]
+                item_vectors = all_vectors[:k]
 
         else:
             user_type = "cold_start"
