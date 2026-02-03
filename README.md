@@ -284,6 +284,16 @@ curl "http://localhost:8000/recommend/123?exclude_ids=100,200,300"
   - Distributed tracing for API requests
   - View request flow through Redis and Qdrant
 
+**Auto-instrumented:**
+- FastAPI HTTP requests (via `opentelemetry-instrumentation-fastapi`)
+- Redis operations (via `opentelemetry-instrumentation-redis`)
+
+**Manually instrumented:**
+- Qdrant `query_points` - vector similarity search
+- Qdrant `retrieve` - point lookups by ID
+
+Each Qdrant span includes attributes: `db.system`, `db.operation`, `db.collection`, `db.qdrant.limit`, `db.qdrant.results_count`.
+
 ### Metrics
 
 Key metrics exposed:
