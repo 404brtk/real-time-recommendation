@@ -17,7 +17,7 @@ dependencies = [
     "prometheus-client>=0.24.1",
     "prometheus-fastapi-instrumentator>=7.1.0",
     "pyarrow>=22.0.0",
-    "pyspark==4.0.0",
+    "pyspark==4.1.1",
     "qdrant-client>=1.16.2",
     "redis>=7.1.0",
     "uvicorn>=0.40.0",
